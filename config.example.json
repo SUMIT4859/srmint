@@ -1,0 +1,17 @@
+{
+  "telegram_bot_token": "YOUR_TELEGRAM_BOT_TOKEN_HERE",
+  "telegram_admin_id": 0,
+  "rpc_url": "https://mainnet.base.org",
+  "fallback_rpc_url": "https://base.llamarpc.com",
+  "gas_limit": 300000,
+  "fee_multiplier": 1.25,
+  "scheduled_fee_multiplier": 2.0,
+  "max_priority_fee_gwei": 1.5,
+  "broadcast_lead_ms": 80,
+  "wallets_file": "wallets.json",
+  "opensea_timeout_ms": 10000,
+  "max_retry_attempts": 30,
+  "retry_interval_ms": 250,
+  "session_heartbeat_interval_seconds": 25
+}
+
