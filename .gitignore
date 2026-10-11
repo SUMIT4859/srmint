@@ -1,0 +1,14 @@
+
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+.env
+.env.*
+!.env.example
+
+config.json
+wallets.json
+
+*.log
