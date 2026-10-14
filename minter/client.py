@@ -179,6 +179,71 @@ class MintAction:
     calldata: bytes
 
 
+@dataclass
+class WalletEligibility:
+    is_eligible: bool
+    price_wei: int = 0
+    price_unit: float = 0.0
+    price_symbol: str = "ETH"
+    reason: str = ""
+
+    @property
+    def is_free(self) -> bool:
+        return self.price_wei == 0
+
+    def format_price(self, eth_usd_rate: float = 2500.0) -> str:
+        if not self.is_eligible:
+            return "Ineligible"
+        if self.is_free:
+            return "FREE ($0.00)"
+        usd = self.price_unit * eth_usd_rate
+        unit_str = f"{self.price_unit:.8f}".rstrip("0").rstrip(".") if self.price_unit > 0 else "0"
+        return f"{unit_str} {self.price_symbol} (~${usd:.2f})"
+
+    def __bool__(self) -> bool:
+        return self.is_eligible
+
+    def __iter__(self):
+        # Backward compatibility for code doing `is_eligible, reason = ...`
+        return iter((self.is_eligible, self.reason))
+
+
+_eth_usd_cache = {"price": 2500.0, "timestamp": 0.0}
+
+
+async def get_eth_usd_rate() -> float:
+    """Fetch current ETH/USD rate with 5-minute caching and resilient fallbacks."""
+    now = time.time()
+    if now - _eth_usd_cache["timestamp"] < 300.0:
+        return _eth_usd_cache["price"]
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT")
+            if resp.status_code == 200:
+                p = float(resp.json().get("price", 0))
+                if p > 0:
+                    _eth_usd_cache["price"] = p
+                    _eth_usd_cache["timestamp"] = now
+                    return p
+    except Exception:
+        pass
+
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            resp = await client.get("https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd")
+            if resp.status_code == 200:
+                p = float(resp.json().get("ethereum", {}).get("usd", 0))
+                if p > 0:
+                    _eth_usd_cache["price"] = p
+                    _eth_usd_cache["timestamp"] = now
+                    return p
+    except Exception:
+        pass
+
+    return _eth_usd_cache["price"]
+
+
 class OpenSeaClient:
     def __init__(self, timeout_seconds: float = 10.0) -> None:
         self.timeout_seconds = timeout_seconds
@@ -479,9 +544,12 @@ class OpenSeaClient:
         verify_resp = await client.post(f"{SITE_URL}/__api/auth/siwe/verify", json=verify_body, headers=headers)
         if verify_resp.status_code == 200:
             # Sync cookies to .opensea.io and gql.opensea.io so GraphQL session is recognized
-            for k, v in list(client.cookies.items()):
-                client.cookies.set(k, v, domain=".opensea.io", path="/")
-                client.cookies.set(k, v, domain="gql.opensea.io", path="/")
+            for cookie in list(client.cookies.jar):
+                try:
+                    client.cookies.set(cookie.name, cookie.value, domain=".opensea.io", path="/")
+                    client.cookies.set(cookie.name, cookie.value, domain="gql.opensea.io", path="/")
+                except Exception:
+                    pass
             client.cookies.set("connected-account-server-hint", wallet.address, domain=".opensea.io", path="/")
             client.cookies.set("connected-account-server-hint", wallet.address, domain="gql.opensea.io", path="/")
 
@@ -562,7 +630,11 @@ class OpenSeaClient:
                             sub_data = actions[0].get("transactionSubmissionData", {})
                             if sub_data and "data" in sub_data:
                                 target = to_checksum_address(sub_data.get("to", OPENSEA_SEADROP_ADDRESS))
-                                val = int(sub_data.get("value", "0x0"), 16) if isinstance(sub_data.get("value"), str) else int(sub_data.get("value", 0))
+                                val_raw = sub_data.get("value", 0)
+                                if isinstance(val_raw, str):
+                                    val = int(val_raw, 16) if val_raw.startswith("0x") else int(val_raw)
+                                else:
+                                    val = int(val_raw)
                                 calldata = bytes.fromhex(sub_data["data"].lstrip("0x"))
                                 return MintAction(target=target, value=val, calldata=calldata)
 
@@ -570,18 +642,192 @@ class OpenSeaClient:
                         if swap_errors:
                             err_names = [e.get("__typename", "") for e in swap_errors if isinstance(e, dict)]
                             if "MinterNotEligibleForActiveDropStageError" in err_names:
-                                raise RuntimeError("Wallet is not on the Allowlist for this stage")
-                            if "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
+                                now_ts = time.time()
+                                # If the target stage has not started yet or is within transition window (up to start + 8s),
+                                # OpenSea's active stage may still be the previous stage. Do not fail permanently yet!
+                                if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
+                                    last_err = RuntimeError("Waiting for OpenSea stage activation...")
+                                else:
+                                    raise RuntimeError("Wallet is not on the Allowlist for this stage")
+                            elif "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
                                 raise RuntimeError("Allocation limit exceeded for this wallet")
-                            last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
+                            else:
+                                last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
             except Exception as e:
                 last_err = e
-                # If definitely not eligible, stop retrying immediately
-                if "not on the allowlist" in str(e).lower() or "not eligible" in str(e).lower():
-                    raise e
+                # If definitely not eligible outside the transition window, stop retrying immediately
+                now_ts = time.time()
+                is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
+                if not is_transition_window:
+                    if "not on the allowlist" in str(e).lower() or "not eligible" in str(e).lower():
+                        raise e
 
             # Adaptive retry sleep
             await asyncio.sleep(retry_interval_ms / 1000.0)
 
         raise RuntimeError(f"OpenSea mint calldata unavailable: {last_err}")
+
+    async def check_wallet_eligibility(
+        self,
+        collection: CollectionInfo,
+        stage: DropStage,
+        wallet: WalletAccount,
+    ) -> WalletEligibility:
+        """
+        Verify if a wallet is eligible to mint in the given drop stage,
+        and retrieve the exact per-wallet mint price.
+        Returns WalletEligibility.
+        """
+        if stage.is_public:
+            return WalletEligibility(
+                is_eligible=True,
+                price_wei=stage.price_wei,
+                price_unit=stage.price_unit,
+                price_symbol=stage.price_symbol,
+                reason="Eligible (Public Sale)",
+            )
+
+        # Ensure wallet has an active SIWE session
+        try:
+            await self.authenticate_wallet(wallet, collection.chain_id, collection.slug)
+        except Exception:
+            pass
+
+        client = await self.get_client()
+        headers = {
+            "accept": "application/json",
+            "origin": SITE_URL,
+            "referer": f"{SITE_URL}/collection/{collection.slug}",
+            "x-app-id": APP_ID,
+        }
+
+        # 1. Query DropEligibilityQuery
+        try:
+            resp = await client.post(
+                GRAPHQL_URL,
+                json={
+                    "operationName": "DropEligibilityQuery",
+                    "query": ELIGIBILITY_QUERY,
+                    "variables": {
+                        "collectionSlug": collection.slug,
+                        "address": wallet.address,
+                    },
+                },
+                headers=headers,
+            )
+            if resp.status_code == 200:
+                d = resp.json().get("data", {}).get("dropBySlug", {})
+                account_elig = d.get("accountStageEligibility") or {}
+                wallets_list = account_elig.get("wallets") or []
+
+                # Baseline fallback price from top-level stage
+                fallback_unit = stage.price_unit
+                fallback_sym = stage.price_symbol
+                fallback_wei = stage.price_wei
+                for st in d.get("stages") or []:
+                    if st.get("uuid") == stage.uuid or st.get("stageIndex") == stage.stage_index:
+                        el_p = (st.get("eligiblePrice") or {}).get("token") or {}
+                        if el_p.get("unit") is not None:
+                            fallback_unit = float(el_p.get("unit") or 0.0)
+                            fallback_sym = el_p.get("symbol") or "ETH"
+                            fallback_wei = int(round(fallback_unit * 1e18))
+
+                for w_info in wallets_list:
+                    if w_info.get("address", "").lower() == wallet.address.lower():
+                        for st_info in w_info.get("stages", []):
+                            if st_info.get("dropStageUuid") == stage.uuid:
+                                if st_info.get("isEligible") is True:
+                                    p_tok = (st_info.get("price") or {}).get("token") or {}
+                                    if p_tok.get("unit") is not None:
+                                        p_unit = float(p_tok.get("unit") or 0.0)
+                                        p_sym = p_tok.get("symbol") or "ETH"
+                                        p_wei = int(round(p_unit * 1e18))
+                                    else:
+                                        p_unit, p_sym, p_wei = fallback_unit, fallback_sym, fallback_wei
+                                    return WalletEligibility(
+                                        is_eligible=True,
+                                        price_wei=p_wei,
+                                        price_unit=p_unit,
+                                        price_symbol=p_sym,
+                                        reason="Eligible (Allowlist Verified)",
+                                    )
+                                elif st_info.get("isEligible") is False:
+                                    return WalletEligibility(
+                                        is_eligible=False,
+                                        price_wei=0,
+                                        price_unit=0.0,
+                                        price_symbol="ETH",
+                                        reason="Not on Allowlist",
+                                    )
+
+                # Check top-level stages array in dropBySlug
+                stages_list = d.get("stages") or []
+                for st in stages_list:
+                    if st.get("uuid") == stage.uuid or st.get("stageIndex") == stage.stage_index:
+                        if st.get("isEligible") is True:
+                            el_p = (st.get("eligiblePrice") or {}).get("token") or {}
+                            if el_p.get("unit") is not None:
+                                p_unit = float(el_p.get("unit") or 0.0)
+                                p_sym = el_p.get("symbol") or "ETH"
+                                p_wei = int(round(p_unit * 1e18))
+                            else:
+                                p_unit, p_sym, p_wei = fallback_unit, fallback_sym, fallback_wei
+                            return WalletEligibility(
+                                is_eligible=True,
+                                price_wei=p_wei,
+                                price_unit=p_unit,
+                                price_symbol=p_sym,
+                                reason="Eligible (Allowlist Verified)",
+                            )
+                        elif st.get("isEligible") is False:
+                            return WalletEligibility(
+                                is_eligible=False,
+                                price_wei=0,
+                                price_unit=0.0,
+                                price_symbol="ETH",
+                                reason="Not on Allowlist",
+                            )
+        except Exception:
+            pass
+
+        # 2. Direct simulation via get_mint_action_hot with 1 attempt (ONLY if stage is live!)
+        now_ts = time.time()
+        if stage.start_timestamp <= now_ts:
+            try:
+                act = await self.get_mint_action_hot(
+                    collection,
+                    wallet,
+                    1,
+                    stage,
+                    max_attempts=1,
+                )
+                if act and act.calldata:
+                    p_wei = act.value
+                    p_unit = act.value / 1e18
+                    return WalletEligibility(
+                        is_eligible=True,
+                        price_wei=p_wei,
+                        price_unit=p_unit,
+                        price_symbol="ETH",
+                        reason="Eligible (Calldata Ready)",
+                    )
+            except Exception as e:
+                err_str = str(e).lower()
+                if "not on the allowlist" in err_str or "not eligible" in err_str or "trading operations" in err_str:
+                    return WalletEligibility(
+                        is_eligible=False,
+                        price_wei=0,
+                        price_unit=0.0,
+                        price_symbol="ETH",
+                        reason="Not on Allowlist",
+                    )
+
+        return WalletEligibility(
+            is_eligible=False,
+            price_wei=0,
+            price_unit=0.0,
+            price_symbol="ETH",
+            reason="Ineligible for this stage",
+        )
+
 

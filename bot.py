@@ -11,7 +11,7 @@ from typing import Any
 import httpx
 
 from minter.chain import ChainClient
-from minter.client import CollectionInfo, DropStage, OpenSeaClient
+from minter.client import CollectionInfo, DropStage, OpenSeaClient, WalletEligibility, get_eth_usd_rate
 from minter.config import AppConfig
 from minter.constants import CHAINS, get_chain_info
 from minter.engine import MintEngine, WalletMintResult
@@ -213,6 +213,43 @@ class TelegramBot:
             price_display = f"<b>{stage.price_unit} {stage.price_symbol}</b> (~{stage.price_wei / 1e18:.6f} ETH)"
             guard_label = f"{stage.price_unit} {stage.price_symbol}"
 
+        all_configured_wallets = self.wallets.get_all()
+        selected_addrs = {w.address for w in wallets}
+
+        eth_usd_rate = await get_eth_usd_rate()
+
+        # Check eligibility upfront for private/allowlist stages
+        eligibility_cache = session.setdefault("eligibility_cache", {})
+        wallet_lines = []
+        for idx, w in enumerate(all_configured_wallets):
+            icon = "✅" if w.address in selected_addrs else "⬜"
+            if stage.is_public:
+                if stage.price_wei == 0:
+                    price_str = "🟢 FREE ($0.00)"
+                else:
+                    usd = stage.price_unit * eth_usd_rate
+                    price_str = f"💎 {stage.price_unit:.6g} {stage.price_symbol} (~${usd:.2f})"
+                badge = f"🟢 Public | {price_str}"
+            else:
+                cache_key = (stage.uuid, w.address)
+                if cache_key not in eligibility_cache:
+                    try:
+                        elig = await self.opensea.check_wallet_eligibility(coll, stage, w)
+                        eligibility_cache[cache_key] = elig
+                    except Exception:
+                        eligibility_cache[cache_key] = WalletEligibility(False, reason="Check Failed")
+                elig: WalletEligibility = eligibility_cache[cache_key]
+                if elig.is_eligible:
+                    price_str = elig.format_price(eth_usd_rate)
+                    if elig.is_free:
+                        badge = f"🟢 Eligible | 🟢 {price_str}"
+                    else:
+                        badge = f"🟢 Eligible | ⚠️ <b>{price_str}</b>"
+                else:
+                    badge = f"🔴 Not Eligible ({elig.reason})"
+
+            wallet_lines.append(f"{icon} <b>{w.label}</b> (<code>{w.short_address}</code>) — {badge}")
+
         text = (
             f"🖼️ <b>{coll.name}</b> (<code>{coll.slug}</code>)\n\n"
             f"🔗 <b>Network:</b> {chain_info['name']} (ID: {coll.chain_id})\n"
@@ -222,8 +259,9 @@ class TelegramBot:
             f"💰 <b>Mint Price:</b> {price_display}\n"
             f"🛡️ <b>Price Guard:</b> 🔒 Locked to {guard_label} (Auto-cancels if changed!)\n"
             f"⏱️ <b>Status:</b> {status_text}\n"
-            f"🔢 <b>Quantity per Wallet:</b> {qty}\n"
-            f"👥 <b>Active Wallets:</b> {len(wallets)}/{self.wallets.count()} selected"
+            f"🔢 <b>Quantity per Wallet:</b> {qty}\n\n"
+            f"👥 <b>Selected Wallets ({len(wallets)}/{len(all_configured_wallets)}):</b>\n"
+            + ("\n".join(wallet_lines) if wallet_lines else "<i>No wallets found. Add with /addwallet</i>")
         )
 
         buttons = []
@@ -249,8 +287,46 @@ class TelegramBot:
             {"text": "➕ 1", "callback_data": "qty_inc"},
         ])
 
+        # Individual Wallet Selector buttons (toggle on/off)
+        if len(all_configured_wallets) > 1:
+            w_rows = []
+            curr_w_row = []
+            for idx, w in enumerate(all_configured_wallets):
+                is_sel = w.address in selected_addrs
+                prefix = "✅ " if is_sel else "⬜ "
+                status_icon = ""
+                if not stage.is_public:
+                    elig_obj = eligibility_cache.get((stage.uuid, w.address))
+                    if elig_obj:
+                        if elig_obj.is_eligible:
+                            status_icon = " [FREE]" if elig_obj.is_free else f" [${elig_obj.price_unit * eth_usd_rate:.2f}]"
+                        else:
+                            status_icon = " [🔴]"
+                curr_w_row.append({
+                    "text": f"{prefix}{w.label[:6]}{status_icon}",
+                    "callback_data": f"toggle_wallet_{idx}",
+                })
+                if len(curr_w_row) == 2:
+                    w_rows.append(curr_w_row)
+                    curr_w_row = []
+            if curr_w_row:
+                w_rows.append(curr_w_row)
+            buttons.extend(w_rows)
+
+            # Quick Select All / Deselect All
+            buttons.append([
+                {"text": "✨ Select All Wallets", "callback_data": "wallet_select_all"},
+                {"text": "🔘 Clear Selection", "callback_data": "wallet_deselect_all"},
+            ])
+
         # Fire Button
-        fire_label = f"🚀 FIRE MINT ({len(wallets)} Wallets)" if is_live else f"⏳ SCHEDULE MINT ({len(wallets)} Wallets)"
+        if len(wallets) == 0:
+            fire_label = "⚠️ SELECT AT LEAST 1 WALLET"
+        elif is_live:
+            fire_label = f"🚀 FIRE MINT ({len(wallets)} Wallet{'s' if len(wallets) > 1 else ''})"
+        else:
+            fire_label = f"⏳ SCHEDULE MINT ({len(wallets)} Wallet{'s' if len(wallets) > 1 else ''})"
+
         buttons.append([{"text": fire_label, "callback_data": "mint_launch"}])
         buttons.append([{"text": "❌ Cancel", "callback_data": "mint_cancel"}])
 
@@ -269,8 +345,91 @@ class TelegramBot:
         expected_price_wei: int = session.get("expected_price_wei", stage.price_wei)
 
         if not wallets:
-            await self.send_message(chat_id, "⚠️ No wallets selected! Add a wallet with /addwallet.")
+            await self.send_message(chat_id, "⚠️ <b>No wallets selected!</b> Please tap a wallet button on the card above to select at least 1 wallet.")
             return
+
+        # Upfront eligibility & per-wallet price verification BEFORE schedule or fire!
+        eth_usd_rate = await get_eth_usd_rate()
+
+        if not stage.is_public:
+            valid_wallets = []
+            ineligible_wallets = []
+            wallet_eligs: dict[str, WalletEligibility] = {}
+
+            for w in wallets:
+                cache_key = (stage.uuid, w.address)
+                elig = session.get("eligibility_cache", {}).get(cache_key)
+                if not elig:
+                    elig = await self.opensea.check_wallet_eligibility(coll, stage, w)
+                    session.setdefault("eligibility_cache", {})[cache_key] = elig
+                wallet_eligs[w.address] = elig
+                if elig.is_eligible:
+                    valid_wallets.append(w)
+                else:
+                    ineligible_wallets.append((w, elig.reason))
+
+            if not valid_wallets:
+                inelig_details = "\n".join(f"• <b>{w.label}</b> ({w.short_address}): <i>{r}</i>" for w, r in ineligible_wallets)
+                await self.send_message(
+                    chat_id,
+                    f"❌ <b>Eligibility Check Failed!</b>\n\n"
+                    f"None of your selected wallet(s) are eligible for <b>{stage.label}</b>:\n{inelig_details}\n\n"
+                    f"💡 <i>Tip: Select an eligible wallet or switch to Public stage!</i>",
+                )
+                return
+
+            if ineligible_wallets:
+                inelig_msg = ", ".join(f"<b>{w.label}</b>" for w, _ in ineligible_wallets)
+                await self.send_message(
+                    chat_id,
+                    f"⚠️ <b>Notice:</b> {inelig_msg} is not on the Allowlist for {stage.label} and was removed.\n"
+                    f"Proceeding with {len(valid_wallets)} eligible wallet(s).",
+                )
+                wallets = valid_wallets
+                session["selected_wallets"] = valid_wallets
+
+            # SAFETY FEATURE 1: Free Mint Protection
+            # If the stage is Free (0 ETH) or user expects Free, but ANY selected wallet has a paid price:
+            # CANCEL IMMEDIATELY TO PROTECT USER FUNDS!
+            is_free_stage = (stage.price_wei == 0) and (expected_price_wei == 0)
+            paid_wallets = [
+                (w, wallet_eligs[w.address])
+                for w in wallets
+                if not wallet_eligs[w.address].is_free
+            ]
+            if is_free_stage and paid_wallets:
+                paid_details = "\n".join(
+                    f"• <b>{w.label}</b> ({w.short_address}): ⚠️ <code>{e.format_price(eth_usd_rate)}</code>"
+                    for w, e in paid_wallets
+                )
+                await self.send_message(
+                    chat_id,
+                    f"🚨 <b>FREE MINT PROTECTION TRIGGERED — MINT CANCELLED!</b>\n\n"
+                    f"This stage is set as <b>FREE (0 ETH)</b>, but OpenSea configured paid pricing for the following selected wallet(s):\n"
+                    f"{paid_details}\n\n"
+                    f"🛡️ <b>Mint Aborted:</b> No transactions were prepared or broadcasted to protect your funds!\n\n"
+                    f"👉 <b>How to fix:</b> Tap the wallet buttons on the mint card above to unselect paid wallets and keep only FREE wallets, or ensure all wallets match.",
+                )
+                return
+
+            # SAFETY FEATURE 2: Price Uniformity Rule
+            # All selected wallets must have the exact same mint price!
+            distinct_prices = {wallet_eligs[w.address].price_wei for w in wallets}
+            if len(distinct_prices) > 1:
+                price_breakdown = "\n".join(
+                    f"• <b>{w.label}</b> ({w.short_address}): <code>{wallet_eligs[w.address].format_price(eth_usd_rate)}</code>"
+                    for w in wallets
+                )
+                await self.send_message(
+                    chat_id,
+                    f"🚨 <b>PRICE MISMATCH DETECTED — MINT CANCELLED!</b>\n\n"
+                    f"Your selected wallets have <b>different mint prices</b> for <b>{stage.label}</b>:\n"
+                    f"{price_breakdown}\n\n"
+                    f"⚠️ <b>Safety Rule:</b> All wallets fired in a batch must have the exact same price (all Free or all identical Paid price). "
+                    f"Mixing different price tiers or mixing Free and Paid wallets is blocked to protect your funds.\n\n"
+                    f"👉 <b>How to fix:</b> Select only wallets with matching mint prices.",
+                )
+                return
 
         async def on_progress(status_text: str) -> None:
             await self.send_message(chat_id, status_text)
@@ -286,10 +445,11 @@ class TelegramBot:
             on_progress=on_progress,
         )
 
-        if any(r.status == "CANCELLED_PRICE_CHANGED" for r in results):
+        if any(r.status.startswith("CANCELLED") for r in results):
+            first_cancelled = next(r for r in results if r.status.startswith("CANCELLED"))
             summary_lines = [
-                "🛑 <b>MINT OPERATION ABORTED BY PRICE GUARD!</b>\n",
-                "⚠️ <b>Reason:</b> Mint price was modified by the developer right before broadcast.",
+                "🛑 <b>MINT OPERATION ABORTED BY SAFETY GUARD!</b>\n",
+                f"⚠️ <b>Reason:</b> {first_cancelled.error_message or first_cancelled.status}",
                 "🛡️ <b>Protection:</b> No transactions were broadcasted. Your wallet balances were not touched.",
             ]
             await self.send_message(chat_id, "\n".join(summary_lines))
@@ -497,6 +657,29 @@ class TelegramBot:
             session = self._active_sessions.get(chat_id)
             if session:
                 session["quantity"] = max(session["quantity"] - 1, 1)
+                await self.render_mint_card(chat_id, msg_id)
+        elif data.startswith("toggle_wallet_"):
+            idx = int(data.split("_")[-1])
+            session = self._active_sessions.get(chat_id)
+            if session:
+                all_w = self.wallets.get_all()
+                if 0 <= idx < len(all_w):
+                    target_w = all_w[idx]
+                    curr_sel = session["selected_wallets"]
+                    if any(w.address == target_w.address for w in curr_sel):
+                        session["selected_wallets"] = [w for w in curr_sel if w.address != target_w.address]
+                    else:
+                        session["selected_wallets"].append(target_w)
+                    await self.render_mint_card(chat_id, msg_id)
+        elif data == "wallet_select_all":
+            session = self._active_sessions.get(chat_id)
+            if session:
+                session["selected_wallets"] = list(self.wallets.get_all())
+                await self.render_mint_card(chat_id, msg_id)
+        elif data == "wallet_deselect_all":
+            session = self._active_sessions.get(chat_id)
+            if session:
+                session["selected_wallets"] = []
                 await self.render_mint_card(chat_id, msg_id)
         elif data == "mint_launch":
             await self.handle_mint_launch(chat_id, msg_id)

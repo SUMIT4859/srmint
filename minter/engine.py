@@ -252,6 +252,53 @@ class MintEngine:
                     for w in wallets
                 ]
                 actions = await asyncio.gather(*action_tasks, return_exceptions=True)
+                valid_acts = [act for act in actions if not isinstance(act, Exception)]
+                if not valid_acts:
+                    for w, act in zip(wallets, actions):
+                        if isinstance(act, Exception):
+                            for r in results:
+                                if r.wallet.address == w.address:
+                                    r.status = "FAILED"
+                                    r.error_message = str(act)
+                    return results
+
+                # Safety Net 1: Uniformity check across all returned actions
+                distinct_act_values = {act.value for act in valid_acts}
+                if len(distinct_act_values) > 1:
+                    alert_msg = (
+                        "🚨 <b>PRICE GUARD: MISMATCHED PRICES IN CALLEDATA!</b>\n"
+                        "OpenSea returned differing prices for your wallets in this batch. Mint aborted before broadcast!"
+                    )
+                    await notify(alert_msg)
+                    for r in results:
+                        r.status = "CANCELLED_PRICE_MISMATCH"
+                        r.error_message = "Differing prices returned across wallets in allowlist calldata"
+                    return results
+
+                # Safety Net 2: Free Mint Protection
+                first_val = valid_acts[0].value
+                if expected_price_wei == 0 and first_val > 0:
+                    alert_msg = (
+                        f"🚨 <b>PRICE GUARD: PAID CALLEDATA ON FREE STAGE!</b>\n"
+                        f"Expected Free (0 ETH), but OpenSea calldata required {first_val / 1e18:.6f} ETH! Mint aborted before broadcast!"
+                    )
+                    await notify(alert_msg)
+                    for r in results:
+                        r.status = "CANCELLED_PAID_ON_FREE"
+                        r.error_message = f"Calldata requested {first_val / 1e18:.6f} ETH on Free stage"
+                    return results
+
+                # Safety Net 3: Maximum Price Check
+                if expected_price_wei is not None and first_val > (expected_price_wei * quantity_per_wallet):
+                    alert_msg = (
+                        f"🚨 <b>PRICE GUARD: PRICE EXCEEDED!</b>\n"
+                        f"Expected {(expected_price_wei * quantity_per_wallet) / 1e18:.6f} ETH, but calldata required {first_val / 1e18:.6f} ETH! Mint aborted."
+                    )
+                    await notify(alert_msg)
+                    for r in results:
+                        r.status = "CANCELLED_PRICE_EXCEEDED"
+                        r.error_message = f"Calldata value ({first_val}) exceeded expected ({expected_price_wei * quantity_per_wallet})"
+                    return results
 
                 for w, act in zip(wallets, actions):
                     if isinstance(act, Exception):

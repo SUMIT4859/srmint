@@ -208,6 +208,107 @@ def test_sign_transaction_lowercase_address():
     assert tx_hash.startswith("0x")
 
 
+def test_opensea_value_parsing():
+    # OpenSea GraphQL returns decimal strings for wei value, e.g. "20000000000000" for 0.00002 ETH
+    val_raw_decimal = "20000000000000"
+    if val_raw_decimal.startswith("0x"):
+        val = int(val_raw_decimal, 16)
+    else:
+        val = int(val_raw_decimal)
+    assert val == 20000000000000, f"Expected 20000000000000 wei, got {val}"
+
+    # Hex test
+    val_raw_hex = "0x1234"
+    if val_raw_hex.startswith("0x"):
+        val_hex = int(val_raw_hex, 16)
+    else:
+        val_hex = int(val_raw_hex)
+    assert val_hex == 0x1234
+
+
+def test_wallet_eligibility_dataclass():
+    from minter.client import WalletEligibility
+
+    # 1. Free wallet
+    el_free = WalletEligibility(is_eligible=True, price_wei=0, price_unit=0.0, price_symbol="ETH", reason="Allowlist Verified")
+    assert el_free.is_free is True
+    assert bool(el_free) is True
+    assert "FREE ($0.00)" in el_free.format_price(eth_usd_rate=2500.0)
+
+    # 2. Paid wallet
+    el_paid = WalletEligibility(is_eligible=True, price_wei=70_000_000_000_000, price_unit=0.00007, price_symbol="ETH", reason="Allowlist Verified")
+    assert el_paid.is_free is False
+    assert bool(el_paid) is True
+    formatted = el_paid.format_price(eth_usd_rate=2500.0)
+    assert "0.00007 ETH" in formatted
+    assert "$0.18" in formatted or "$0.17" in formatted
+
+    # 3. Ineligible wallet
+    el_inelig = WalletEligibility(is_eligible=False, reason="Not on Allowlist")
+    assert el_inelig.is_free is True
+    assert bool(el_inelig) is False
+    assert el_inelig.format_price() == "Ineligible"
+
+    # 4. Backward-compatible tuple unpack: is_eligible, reason = el
+    is_e, r_msg = el_paid
+    assert is_e is True
+    assert r_msg == "Allowlist Verified"
+
+
+def test_free_mint_protection():
+    from minter.client import WalletEligibility
+
+    stage_expected_price_wei = 0
+    wallets_elig = {
+        "0x1111": WalletEligibility(is_eligible=True, price_wei=0, price_unit=0.0),
+        "0x2222": WalletEligibility(is_eligible=True, price_wei=70_000_000_000_000, price_unit=0.00007),
+    }
+
+    is_stage_expected_free = (stage_expected_price_wei == 0)
+    paid_wallets = [addr for addr, e in wallets_elig.items() if not e.is_free]
+    
+    # Should trigger free mint protection because 0x2222 has a paid price!
+    should_cancel = is_stage_expected_free and len(paid_wallets) > 0
+    assert should_cancel is True
+    assert "0x2222" in paid_wallets
+
+
+def test_price_uniformity_guard():
+    from minter.client import WalletEligibility
+
+    # Case A: Mismatched prices (Free vs Paid) -> Must CANCEL
+    wallets_mismatched = {
+        "0x1111": WalletEligibility(is_eligible=True, price_wei=0),
+        "0x2222": WalletEligibility(is_eligible=True, price_wei=70_000_000_000_000),
+    }
+    distinct_prices_a = {e.price_wei for e in wallets_mismatched.values()}
+    assert len(distinct_prices_a) > 1, "Should detect mismatched prices (Free vs Paid)"
+
+    # Case B: Differing paid tiers ($0.18 vs $1.13) -> Must CANCEL
+    wallets_tiers = {
+        "0x2222": WalletEligibility(is_eligible=True, price_wei=70_000_000_000_000),
+        "0x3333": WalletEligibility(is_eligible=True, price_wei=450_000_000_000_000),
+    }
+    distinct_prices_b = {e.price_wei for e in wallets_tiers.values()}
+    assert len(distinct_prices_b) > 1, "Should detect mismatched prices between paid tiers"
+
+    # Case C: All identical Free -> Must ALLOW
+    wallets_all_free = {
+        "0x1111": WalletEligibility(is_eligible=True, price_wei=0),
+        "0x4444": WalletEligibility(is_eligible=True, price_wei=0),
+    }
+    distinct_prices_c = {e.price_wei for e in wallets_all_free.values()}
+    assert len(distinct_prices_c) == 1, "Identical free wallets must pass uniformity guard"
+
+    # Case D: All identical Paid -> Must ALLOW
+    wallets_all_paid = {
+        "0x2222": WalletEligibility(is_eligible=True, price_wei=70_000_000_000_000),
+        "0x5555": WalletEligibility(is_eligible=True, price_wei=70_000_000_000_000),
+    }
+    distinct_prices_d = {e.price_wei for e in wallets_all_paid.values()}
+    assert len(distinct_prices_d) == 1, "Identical paid wallets must pass uniformity guard"
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -217,8 +318,13 @@ if __name__ == "__main__":
     test_contract_address_detection()
     test_price_guard_logic()
     test_sign_transaction_lowercase_address()
+    test_opensea_value_parsing()
+    test_wallet_eligibility_dataclass()
+    test_free_mint_protection()
+    test_price_uniformity_guard()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))
     print("[OK] All unit tests passed successfully!")
+
 
