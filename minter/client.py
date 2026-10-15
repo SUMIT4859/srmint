@@ -248,10 +248,12 @@ class OpenSeaClient:
     def __init__(self, timeout_seconds: float = 10.0) -> None:
         self.timeout_seconds = timeout_seconds
         self._client: httpx.AsyncClient | None = None
+        self._wallet_clients: dict[str, httpx.AsyncClient] = {}  # address -> isolated httpx.AsyncClient
         self._wallet_sessions: dict[str, dict[str, str]] = {}  # address -> cookies/headers
         self._heartbeat_task: asyncio.Task | None = None
 
     async def get_client(self) -> httpx.AsyncClient:
+        """General unauthenticated client for public collection metadata."""
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=self.timeout_seconds,
@@ -262,10 +264,29 @@ class OpenSeaClient:
             )
         return self._client
 
+    async def get_wallet_client(self, wallet_address: str) -> httpx.AsyncClient:
+        """Dedicated client with isolated cookie jar for a specific wallet."""
+        addr = wallet_address.lower()
+        cl = self._wallet_clients.get(addr)
+        if cl is None or cl.is_closed:
+            cl = httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                headers={"user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"},
+                limits=httpx.Limits(max_connections=15, max_keepalive_connections=15, keepalive_expiry=120.0),
+                http2=True,
+                follow_redirects=True,
+            )
+            self._wallet_clients[addr] = cl
+        return cl
+
     async def close(self) -> None:
         self.stop_heartbeat()
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+        for cl in self._wallet_clients.values():
+            if not cl.is_closed:
+                await cl.aclose()
+        self._wallet_clients.clear()
 
     def start_heartbeat(self, slug: str, wallets: list[WalletAccount], interval_seconds: int = 25) -> None:
         """Start background session keepalive to prevent timeouts during long waits."""
@@ -498,8 +519,8 @@ class OpenSeaClient:
         )
 
     async def authenticate_wallet(self, wallet: WalletAccount, chain_id: int, slug: str) -> None:
-        """Authenticate wallet using SIWE on OpenSea."""
-        client = await self.get_client()
+        """Authenticate wallet using SIWE on OpenSea with its isolated client."""
+        client = await self.get_wallet_client(wallet.address)
         coll_url = f"{SITE_URL}/collection/{slug}"
         headers = {
             "origin": SITE_URL,
@@ -568,7 +589,7 @@ class OpenSeaClient:
         retry_interval_ms: int = 200,
     ) -> MintAction:
         """Fetch private/allowlist mint calldata with resilient adaptive retry."""
-        client = await self.get_client()
+        client = await self.get_wallet_client(wallet.address)
         zero_addr = "0x0000000000000000000000000000000000000000"
         variables = {
             "address": wallet.address,
@@ -693,7 +714,7 @@ class OpenSeaClient:
         except Exception:
             pass
 
-        client = await self.get_client()
+        client = await self.get_wallet_client(wallet.address)
         headers = {
             "accept": "application/json",
             "origin": SITE_URL,
@@ -764,7 +785,26 @@ class OpenSeaClient:
                 stages_list = d.get("stages") or []
                 for st in stages_list:
                     if st.get("uuid") == stage.uuid or st.get("stageIndex") == stage.stage_index:
-                        if st.get("isEligible") is True:
+                        el_minter = (st.get("eligibleMinterAddress") or "").lower()
+                        if el_minter:
+                            if el_minter == wallet.address.lower() and st.get("isEligible") is True:
+                                el_p = (st.get("eligiblePrice") or {}).get("token") or {}
+                                if el_p.get("unit") is not None:
+                                    p_unit = float(el_p.get("unit") or 0.0)
+                                    p_sym = el_p.get("symbol") or "ETH"
+                                    p_wei = int(round(p_unit * 1e18))
+                                else:
+                                    p_unit, p_sym, p_wei = fallback_unit, fallback_sym, fallback_wei
+                                return WalletEligibility(
+                                    is_eligible=True,
+                                    price_wei=p_wei,
+                                    price_unit=p_unit,
+                                    price_symbol=p_sym,
+                                    reason="Eligible (Allowlist Verified)",
+                                )
+                            elif el_minter != wallet.address.lower():
+                                continue
+                        elif st.get("isEligible") is True and not wallets_list:
                             el_p = (st.get("eligiblePrice") or {}).get("token") or {}
                             if el_p.get("unit") is not None:
                                 p_unit = float(el_p.get("unit") or 0.0)
@@ -778,14 +818,6 @@ class OpenSeaClient:
                                 price_unit=p_unit,
                                 price_symbol=p_sym,
                                 reason="Eligible (Allowlist Verified)",
-                            )
-                        elif st.get("isEligible") is False:
-                            return WalletEligibility(
-                                is_eligible=False,
-                                price_wei=0,
-                                price_unit=0.0,
-                                price_symbol="ETH",
-                                reason="Not on Allowlist",
                             )
         except Exception:
             pass

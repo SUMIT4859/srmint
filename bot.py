@@ -294,16 +294,16 @@ class TelegramBot:
             for idx, w in enumerate(all_configured_wallets):
                 is_sel = w.address in selected_addrs
                 prefix = "✅ " if is_sel else "⬜ "
-                status_icon = ""
-                if not stage.is_public:
+                if stage.is_public:
+                    status_icon = " [🟢]"
+                else:
                     elig_obj = eligibility_cache.get((stage.uuid, w.address))
-                    if elig_obj:
-                        if elig_obj.is_eligible:
-                            status_icon = " [FREE]" if elig_obj.is_free else f" [${elig_obj.price_unit * eth_usd_rate:.2f}]"
-                        else:
-                            status_icon = " [🔴]"
+                    if elig_obj and elig_obj.is_eligible:
+                        status_icon = " [🟢]"
+                    else:
+                        status_icon = " [🔴]"
                 curr_w_row.append({
-                    "text": f"{prefix}{w.label[:6]}{status_icon}",
+                    "text": f"{prefix}{w.label[:8]}{status_icon}",
                     "callback_data": f"toggle_wallet_{idx}",
                 })
                 if len(curr_w_row) == 2:
@@ -359,7 +359,7 @@ class TelegramBot:
             for w in wallets:
                 cache_key = (stage.uuid, w.address)
                 elig = session.get("eligibility_cache", {}).get(cache_key)
-                if not elig:
+                if not elig or not elig.is_eligible:
                     elig = await self.opensea.check_wallet_eligibility(coll, stage, w)
                     session.setdefault("eligibility_cache", {})[cache_key] = elig
                 wallet_eligs[w.address] = elig
