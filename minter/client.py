@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -587,8 +588,9 @@ class OpenSeaClient:
         stage: DropStage,
         max_attempts: int = 30,
         retry_interval_ms: int = 200,
+        single_attempt: bool = False,
     ) -> MintAction:
-        """Fetch private/allowlist mint calldata with resilient adaptive retry."""
+        """Fetch private/allowlist mint calldata with rate-limit protection and adaptive retry."""
         client = await self.get_wallet_client(wallet.address)
         zero_addr = "0x0000000000000000000000000000000000000000"
         variables = {
@@ -622,7 +624,8 @@ class OpenSeaClient:
         }
 
         last_err = None
-        for attempt in range(1, max_attempts + 1):
+        attempts = 1 if single_attempt else max_attempts
+        for attempt in range(1, attempts + 1):
             try:
                 resp = await client.post(
                     GRAPHQL_URL,
@@ -633,58 +636,102 @@ class OpenSeaClient:
                     },
                     headers=headers,
                 )
-                if resp.status_code == 200:
-                    resp_json = resp.json()
-                    errors = resp_json.get("errors") or []
-                    if errors:
-                        err_msgs = [e.get("message", "") for e in errors if isinstance(e, dict)]
-                        err_text = ", ".join(err_msgs)
-                        if "can not perform trading operations" in err_text.lower() or "cannot perform trading operations" in err_text.lower():
-                            raise RuntimeError("Wallet is not on the Allowlist / Not eligible for this private stage")
-                        last_err = RuntimeError(f"OpenSea: {err_text}")
 
-                    data = resp_json.get("data")
-                    if data and isinstance(data, dict):
-                        swap = data.get("swap") or {}
-                        actions = swap.get("actions", [])
-                        if actions:
-                            sub_data = actions[0].get("transactionSubmissionData", {})
-                            if sub_data and "data" in sub_data:
-                                target = to_checksum_address(sub_data.get("to", OPENSEA_SEADROP_ADDRESS))
-                                val_raw = sub_data.get("value", 0)
-                                if isinstance(val_raw, str):
-                                    val = int(val_raw, 16) if val_raw.startswith("0x") else int(val_raw)
-                                else:
-                                    val = int(val_raw)
-                                calldata = bytes.fromhex(sub_data["data"].lstrip("0x"))
-                                return MintAction(target=target, value=val, calldata=calldata)
+                # 1. Handle HTTP 429 Too Many Requests
+                if resp.status_code == 429:
+                    retry_after_hdr = resp.headers.get("retry-after")
+                    if retry_after_hdr:
+                        try:
+                            delay = max(0.4, float(retry_after_hdr) + random.uniform(0.05, 0.15))
+                        except ValueError:
+                            delay = 0.5 + random.uniform(0.05, 0.15)
+                    else:
+                        delay = min(2.5, 0.3 * (1.5 ** attempt) + random.uniform(0.05, 0.20))
 
-                        swap_errors = swap.get("errors", [])
-                        if swap_errors:
-                            err_names = [e.get("__typename", "") for e in swap_errors if isinstance(e, dict)]
-                            if "MinterNotEligibleForActiveDropStageError" in err_names:
-                                now_ts = time.time()
-                                # If the target stage has not started yet or is within transition window (up to start + 8s),
-                                # OpenSea's active stage may still be the previous stage. Do not fail permanently yet!
-                                if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
-                                    last_err = RuntimeError("Waiting for OpenSea stage activation...")
-                                else:
-                                    raise RuntimeError("Wallet is not on the Allowlist for this stage")
-                            elif "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
-                                raise RuntimeError("Allocation limit exceeded for this wallet")
+                    last_err = RuntimeError(f"OpenSea: Rate Limited (HTTP 429), backing off {delay:.2f}s")
+                    if single_attempt:
+                        raise last_err
+                    await asyncio.sleep(delay)
+                    continue
+
+                if resp.status_code != 200:
+                    last_err = RuntimeError(f"OpenSea HTTP {resp.status_code}")
+                    if single_attempt:
+                        raise last_err
+                    delay = min(1.5, 0.25 * (1.3 ** attempt) + random.uniform(0.05, 0.10))
+                    await asyncio.sleep(delay)
+                    continue
+
+                resp_json = resp.json()
+                errors = resp_json.get("errors") or []
+                if errors:
+                    err_msgs = [e.get("message", "") for e in errors if isinstance(e, dict)]
+                    err_text = ", ".join(err_msgs)
+
+                    # GraphQL rate limit error
+                    if "too many requests" in err_text.lower() or "rate limit" in err_text.lower() or "throttled" in err_text.lower():
+                        delay = min(2.5, 0.3 * (1.5 ** attempt) + random.uniform(0.05, 0.20))
+                        last_err = RuntimeError(f"OpenSea: Rate Limited ({err_text}), backing off {delay:.2f}s")
+                        if single_attempt:
+                            raise last_err
+                        await asyncio.sleep(delay)
+                        continue
+
+                    if "can not perform trading operations" in err_text.lower() or "cannot perform trading operations" in err_text.lower():
+                        raise RuntimeError("Wallet is not on the Allowlist / Not eligible for this private stage")
+
+                    last_err = RuntimeError(f"OpenSea: {err_text}")
+
+                data = resp_json.get("data")
+                if data and isinstance(data, dict):
+                    swap = data.get("swap") or {}
+                    actions = swap.get("actions", [])
+                    if actions:
+                        sub_data = actions[0].get("transactionSubmissionData", {})
+                        if sub_data and "data" in sub_data:
+                            target = to_checksum_address(sub_data.get("to", OPENSEA_SEADROP_ADDRESS))
+                            val_raw = sub_data.get("value", 0)
+                            if isinstance(val_raw, str):
+                                val = int(val_raw, 16) if val_raw.startswith("0x") else int(val_raw)
                             else:
-                                last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
+                                val = int(val_raw)
+                            calldata = bytes.fromhex(sub_data["data"].lstrip("0x"))
+                            return MintAction(target=target, value=val, calldata=calldata)
+
+                    swap_errors = swap.get("errors", [])
+                    if swap_errors:
+                        err_names = [e.get("__typename", "") for e in swap_errors if isinstance(e, dict)]
+                        if "MinterNotEligibleForActiveDropStageError" in err_names:
+                            if single_attempt:
+                                raise RuntimeError("Waiting for OpenSea stage activation...")
+                            now_ts = time.time()
+                            # If target stage has not started yet or within transition window, wait for activation
+                            if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
+                                last_err = RuntimeError("Waiting for OpenSea stage activation...")
+                            else:
+                                raise RuntimeError("Wallet is not on the Allowlist for this stage")
+                        elif "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
+                            raise RuntimeError("Allocation limit exceeded for this wallet")
+                        else:
+                            last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
             except Exception as e:
                 last_err = e
-                # If definitely not eligible outside the transition window, stop retrying immediately
+                if single_attempt:
+                    raise e
+                # If definitely not eligible outside transition window, stop retrying immediately
                 now_ts = time.time()
                 is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
+                err_str = str(e).lower()
+                if "allocation limit exceeded" in err_str:
+                    raise e
                 if not is_transition_window:
-                    if "not on the allowlist" in str(e).lower() or "not eligible" in str(e).lower():
+                    if "not on the allowlist" in err_str or "not eligible" in err_str:
                         raise e
 
-            # Adaptive retry sleep
-            await asyncio.sleep(retry_interval_ms / 1000.0)
+            # Adaptive retry sleep with jitter
+            if attempt < attempts:
+                jitter = random.uniform(0.02, 0.06)
+                await asyncio.sleep((retry_interval_ms / 1000.0) + jitter)
 
         raise RuntimeError(f"OpenSea mint calldata unavailable: {last_err}")
 

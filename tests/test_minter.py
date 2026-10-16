@@ -309,6 +309,211 @@ def test_price_uniformity_guard():
     assert len(distinct_prices_d) == 1, "Identical paid wallets must pass uniformity guard"
 
 
+def test_rate_limit_handling():
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+    from minter.client import OpenSeaClient, CollectionInfo, DropStage
+    from minter.wallet import WalletAccount
+
+    client = OpenSeaClient()
+    wallet = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001")
+    coll = CollectionInfo(
+        name="TestDrop",
+        slug="test-drop",
+        contract_address="0x1111111111111111111111111111111111111111",
+        image_url="",
+        chain_identifier="ROBINHOOD",
+        chain_id=4663,
+        total_supply=100,
+        max_supply=100,
+        stages=[],
+    )
+    stage = DropStage(
+        uuid="s1",
+        label="Allowlist",
+        stage_type="PRIVATE_SALE",
+        stage_index=0,
+        start_time="",
+        end_time="",
+        start_timestamp=int(time.time() + 100),
+        end_timestamp=int(time.time() + 200),
+        max_per_wallet=1,
+        price_wei=0,
+        price_symbol="ETH",
+        price_unit=0.0,
+    )
+
+    # In single_attempt mode, hitting 429 should raise immediately without retrying
+    mock_http_client = AsyncMock()
+    mock_http_client.is_closed = False
+    mock_resp = MagicMock()
+    mock_resp.status_code = 429
+    mock_resp.headers = {"retry-after": "1.5"}
+    mock_http_client.post.return_value = mock_resp
+    client._wallet_clients[wallet.address.lower()] = mock_http_client
+
+    async def run_test():
+        try:
+            await client.get_mint_action_hot(coll, wallet, 1, stage, max_attempts=1, single_attempt=True)
+            assert False, "Should have raised on 429"
+        except Exception as ex:
+            assert "Rate Limited" in str(ex) or "429" in str(ex)
+
+    asyncio.run(run_test())
+
+
+def test_single_attempt_stage_activation():
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+    from minter.client import OpenSeaClient, CollectionInfo, DropStage
+    from minter.wallet import WalletAccount
+
+    client = OpenSeaClient()
+    wallet = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001")
+    coll = CollectionInfo(
+        name="TestDrop",
+        slug="test-drop",
+        contract_address="0x1111111111111111111111111111111111111111",
+        image_url="",
+        chain_identifier="ROBINHOOD",
+        chain_id=4663,
+        total_supply=100,
+        max_supply=100,
+        stages=[],
+    )
+    stage = DropStage(
+        uuid="s1",
+        label="Allowlist",
+        stage_type="PRIVATE_SALE",
+        stage_index=0,
+        start_time="",
+        end_time="",
+        start_timestamp=int(time.time() + 100),
+        end_timestamp=int(time.time() + 200),
+        max_per_wallet=1,
+        price_wei=0,
+        price_symbol="ETH",
+        price_unit=0.0,
+    )
+
+    mock_http_client = AsyncMock()
+    mock_http_client.is_closed = False
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "data": {
+            "swap": {
+                "actions": [],
+                "errors": [{"__typename": "MinterNotEligibleForActiveDropStageError"}]
+            }
+        }
+    }
+    mock_http_client.post.return_value = mock_resp
+    client._wallet_clients[wallet.address.lower()] = mock_http_client
+
+    async def run_test():
+        try:
+            await client.get_mint_action_hot(coll, wallet, 1, stage, max_attempts=1, single_attempt=True)
+            assert False, "Should have raised stage activation wait"
+        except Exception as ex:
+            assert "Waiting for OpenSea stage activation..." in str(ex)
+
+    asyncio.run(run_test())
+
+
+def test_pipelined_mint_engine_execution():
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+    from minter.engine import MintEngine
+    from minter.client import CollectionInfo, DropStage, MintAction
+    from minter.config import AppConfig
+    from minter.chain import GasFees, TransactionReceipt
+
+    cfg = AppConfig()
+    cfg.broadcast_lead_ms = 0
+    cfg.gas_limit = 250000
+
+    mock_chain = AsyncMock()
+    mock_chain.get_chain_id.return_value = 4663
+    mock_chain.get_balances_batch.return_value = {"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf": 10**18}
+    mock_chain.get_nonces_batch.return_value = {"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf": 0}
+    mock_chain.get_gas_fees.return_value = GasFees(base_fee_per_gas=20000000, max_priority_fee_per_gas=100000, max_fee_per_gas=25000000)
+    mock_chain.broadcast_raw_transaction.return_value = "0x" + "a" * 64
+    mock_chain.wait_for_receipt.return_value = TransactionReceipt(
+        transaction_hash="0x" + "a" * 64,
+        status=1,
+        block_number=12345,
+        gas_used=120000,
+        effective_gas_price=20000000,
+    )
+
+    mock_opensea = AsyncMock()
+    mock_opensea.stop_heartbeat = MagicMock()
+    mock_opensea.start_heartbeat = MagicMock()
+    # At T-10s (attempt 1), simulate stage not active yet
+    # At T-0, simulate calldata becomes available!
+    call_count = 0
+    async def fake_get_mint_action(coll, w, qty, stg, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if kwargs.get("single_attempt"):
+            raise RuntimeError("Waiting for OpenSea stage activation...")
+        return MintAction(
+            target="0x00005ea00Ac477B1030CE78506496e8C2dE24bf5",
+            value=0,
+            calldata=b"\x12\x34\x56\x78",
+        )
+
+    mock_opensea.get_mint_action_hot = fake_get_mint_action
+
+    engine = MintEngine(cfg, mock_chain, mock_opensea)
+    wallet = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001")
+    coll = CollectionInfo(
+        name="TestDrop",
+        slug="test-drop",
+        contract_address="0x1111111111111111111111111111111111111111",
+        image_url="",
+        chain_identifier="ROBINHOOD",
+        chain_id=4663,
+        total_supply=100,
+        max_supply=100,
+        stages=[],
+    )
+    # Stage starts right now (no sleep wait)
+    stage = DropStage(
+        uuid="s1",
+        label="Allowlist",
+        stage_type="PRIVATE_SALE",
+        stage_index=0,
+        start_time="",
+        end_time="",
+        start_timestamp=int(time.time()),
+        end_timestamp=int(time.time() + 200),
+        max_per_wallet=1,
+        price_wei=0,
+        price_symbol="ETH",
+        price_unit=0.0,
+    )
+
+    async def run_engine_test():
+        results = await engine.execute_mint(
+            collection=coll,
+            stage=stage,
+            wallets=[wallet],
+            quantity_per_wallet=1,
+            expected_price_wei=0,
+        )
+        assert len(results) == 1
+        assert results[0].status == "SUCCESS"
+        assert results[0].tx_hash.startswith("0x")
+        assert results[0].gas_used == 120000
+
+    asyncio.run(run_engine_test())
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -322,6 +527,9 @@ if __name__ == "__main__":
     test_wallet_eligibility_dataclass()
     test_free_mint_protection()
     test_price_uniformity_guard()
+    test_rate_limit_handling()
+    test_single_attempt_stage_activation()
+    test_pipelined_mint_engine_execution()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

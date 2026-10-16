@@ -203,20 +203,17 @@ class MintEngine:
             )
 
             # Prepare transactions
-            prepared_tx_bytes: list[bytes] = []
+            prepared_tx_map: dict[str, bytes] = {}
+            wallets_needing_t0: list[WalletAccount] = []
 
             if is_public:
                 # Direct on-chain SeaDrop mintPublic: zero API delay, instant 100% pre-signed!
-                calldata_per_wallet = [
-                    encode_public_mint(
+                for w in wallets:
+                    cdata = encode_public_mint(
                         nft_contract=collection.contract_address,
                         minter_recipient=w.address,
                         quantity=quantity_per_wallet,
                     )
-                    for w in wallets
-                ]
-
-                for w, cdata in zip(wallets, calldata_per_wallet):
                     nonce = nonces[w.address]
                     val = stage.price_wei * quantity_per_wallet
                     tx_dict = {
@@ -231,101 +228,103 @@ class MintEngine:
                         "data": cdata,
                     }
                     raw_bytes, tx_hash = w.sign_transaction(tx_dict)
-                    prepared_tx_bytes.append(raw_bytes)
+                    prepared_tx_map[w.address] = raw_bytes
                     for r in results:
                         if r.wallet.address == w.address:
                             r.tx_hash = tx_hash
                             r.explorer_url = get_tx_explorer_url(chain_id, tx_hash)
 
             else:
-                # Private/Allowlist: fetch mint calldata
-                await notify("📡 Requesting allowlist calldata from OpenSea...")
-                action_tasks = [
-                    self.opensea.get_mint_action_hot(
-                        collection,
-                        w,
-                        quantity_per_wallet,
-                        stage,
-                        max_attempts=self.config.max_retry_attempts,
-                        retry_interval_ms=self.config.retry_interval_ms,
-                    )
-                    for w in wallets
-                ]
-                actions = await asyncio.gather(*action_tasks, return_exceptions=True)
-                valid_acts = [act for act in actions if not isinstance(act, Exception)]
-                if not valid_acts:
-                    for w, act in zip(wallets, actions):
-                        if isinstance(act, Exception):
-                            for r in results:
-                                if r.wallet.address == w.address:
-                                    r.status = "FAILED"
-                                    r.error_message = str(act)
+                # Private/Allowlist: zero-spam single-attempt pre-fetch
+                await notify("📡 T-10s: Checking for advance allowlist calldata (single attempt)...")
+                prefetch_sem = asyncio.Semaphore(3)
+
+                async def prefetch_check(idx: int, w: WalletAccount):
+                    await asyncio.sleep(idx * 0.025)
+                    async with prefetch_sem:
+                        return await self.opensea.get_mint_action_hot(
+                            collection,
+                            w,
+                            quantity_per_wallet,
+                            stage,
+                            max_attempts=1,
+                            single_attempt=True,
+                        )
+
+                prefetch_tasks = [prefetch_check(i, w) for i, w in enumerate(wallets)]
+                prefetch_results = await asyncio.gather(*prefetch_tasks, return_exceptions=True)
+
+                prefetched_actions: dict[str, MintAction] = {}
+                for w, act_res in zip(wallets, prefetch_results):
+                    r = next(res for res in results if res.wallet.address == w.address)
+                    if isinstance(act_res, MintAction):
+                        # Safety Net: Price Guard checks
+                        if expected_price_wei == 0 and act_res.value > 0:
+                            r.status = "CANCELLED_PAID_ON_FREE"
+                            r.error_message = f"Calldata required {act_res.value / 1e18:.6f} ETH on Free stage"
+                            continue
+                        if expected_price_wei is not None and act_res.value > (expected_price_wei * quantity_per_wallet):
+                            r.status = "CANCELLED_PRICE_EXCEEDED"
+                            r.error_message = f"Calldata value ({act_res.value}) exceeded expected ({expected_price_wei * quantity_per_wallet})"
+                            continue
+
+                        nonce = nonces[w.address]
+                        tx_dict = {
+                            "type": 2,
+                            "chainId": chain_id,
+                            "nonce": nonce,
+                            "maxPriorityFeePerGas": gas_fees.max_priority_fee_per_gas,
+                            "maxFeePerGas": gas_fees.max_fee_per_gas,
+                            "gas": self.config.gas_limit,
+                            "to": to_checksum_address(act_res.target),
+                            "value": act_res.value,
+                            "data": act_res.calldata,
+                        }
+                        raw_bytes, tx_hash = w.sign_transaction(tx_dict)
+                        prepared_tx_map[w.address] = raw_bytes
+                        r.tx_hash = tx_hash
+                        r.explorer_url = get_tx_explorer_url(chain_id, tx_hash)
+                        prefetched_actions[w.address] = act_res
+
+                    elif isinstance(act_res, Exception):
+                        err_msg = str(act_res)
+                        if "stage activation" in err_msg.lower() or "not active" in err_msg.lower():
+                            # Stage unlocks at T-0: queue for T-0 pipeline without spamming
+                            wallets_needing_t0.append(w)
+                        elif "not on the allowlist" in err_msg.lower() or "not eligible" in err_msg.lower() or "allocation limit exceeded" in err_msg.lower():
+                            r.status = "FAILED"
+                            r.error_message = err_msg
+                        else:
+                            # Rate limited or temporary network error: queue for T-0 pipeline
+                            wallets_needing_t0.append(w)
+
+                # Check if price guard cancelled any pre-signed wallet
+                if any(r.status.startswith("CANCELLED") for r in results):
+                    first_canc = next(r for r in results if r.status.startswith("CANCELLED"))
+                    await notify(f"🚨 <b>PRICE GUARD ABORT:</b> {first_canc.error_message}")
                     return results
 
-                # Safety Net 1: Uniformity check across all returned actions
-                distinct_act_values = {act.value for act in valid_acts}
-                if len(distinct_act_values) > 1:
-                    alert_msg = (
-                        "🚨 <b>PRICE GUARD: MISMATCHED PRICES IN CALLEDATA!</b>\n"
-                        "OpenSea returned differing prices for your wallets in this batch. Mint aborted before broadcast!"
-                    )
-                    await notify(alert_msg)
-                    for r in results:
-                        r.status = "CANCELLED_PRICE_MISMATCH"
-                        r.error_message = "Differing prices returned across wallets in allowlist calldata"
-                    return results
-
-                # Safety Net 2: Free Mint Protection
-                first_val = valid_acts[0].value
-                if expected_price_wei == 0 and first_val > 0:
-                    alert_msg = (
-                        f"🚨 <b>PRICE GUARD: PAID CALLEDATA ON FREE STAGE!</b>\n"
-                        f"Expected Free (0 ETH), but OpenSea calldata required {first_val / 1e18:.6f} ETH! Mint aborted before broadcast!"
-                    )
-                    await notify(alert_msg)
-                    for r in results:
-                        r.status = "CANCELLED_PAID_ON_FREE"
-                        r.error_message = f"Calldata requested {first_val / 1e18:.6f} ETH on Free stage"
-                    return results
-
-                # Safety Net 3: Maximum Price Check
-                if expected_price_wei is not None and first_val > (expected_price_wei * quantity_per_wallet):
-                    alert_msg = (
-                        f"🚨 <b>PRICE GUARD: PRICE EXCEEDED!</b>\n"
-                        f"Expected {(expected_price_wei * quantity_per_wallet) / 1e18:.6f} ETH, but calldata required {first_val / 1e18:.6f} ETH! Mint aborted."
-                    )
-                    await notify(alert_msg)
-                    for r in results:
-                        r.status = "CANCELLED_PRICE_EXCEEDED"
-                        r.error_message = f"Calldata value ({first_val}) exceeded expected ({expected_price_wei * quantity_per_wallet})"
-                    return results
-
-                for w, act in zip(wallets, actions):
-                    if isinstance(act, Exception):
+                # Price Uniformity Guard on pre-fetched actions
+                if len(prefetched_actions) > 1:
+                    distinct_vals = {act.value for act in prefetched_actions.values()}
+                    if len(distinct_vals) > 1:
+                        alert_msg = (
+                            "🚨 <b>PRICE GUARD: MISMATCHED PRICES IN CALLEDATA!</b>\n"
+                            "Differing prices returned across wallets in pre-fetched allowlist calldata. Mint aborted!"
+                        )
+                        await notify(alert_msg)
                         for r in results:
-                            if r.wallet.address == w.address:
-                                r.status = "FAILED"
-                                r.error_message = str(act)
-                        continue
+                            r.status = "CANCELLED_PRICE_MISMATCH"
+                            r.error_message = "Differing prices returned across wallets in allowlist calldata"
+                        return results
 
-                    nonce = nonces[w.address]
-                    tx_dict = {
-                        "type": 2,
-                        "chainId": chain_id,
-                        "nonce": nonce,
-                        "maxPriorityFeePerGas": gas_fees.max_priority_fee_per_gas,
-                        "maxFeePerGas": gas_fees.max_fee_per_gas,
-                        "gas": self.config.gas_limit,
-                        "to": to_checksum_address(act.target),
-                        "value": act.value,
-                        "data": act.calldata,
-                    }
-                    raw_bytes, tx_hash = w.sign_transaction(tx_dict)
-                    prepared_tx_bytes.append(raw_bytes)
-                    for r in results:
-                        if r.wallet.address == w.address:
-                            r.tx_hash = tx_hash
-                            r.explorer_url = get_tx_explorer_url(chain_id, tx_hash)
+                ready_count = len(prepared_tx_map)
+                if ready_count == len(wallets):
+                    await notify(f"⚡ All {ready_count} wallet(s) 100% pre-signed & ready for instant T-0 firing!")
+                elif ready_count > 0:
+                    await notify(f"⚡ {ready_count} wallet(s) pre-signed! {len(wallets_needing_t0)} queued for pipelined T-0 fetch.")
+                else:
+                    await notify(f"⏳ Calldata will unlock at T-0. Pipelined workers ready for {len(wallets_needing_t0)} wallet(s).")
 
             # 5. High-Precision Countdown to T-0 with Lead Offset Compensation
             if target_start_ts > time.time():
@@ -336,74 +335,103 @@ class MintEngine:
                 if rem > 0:
                     await asyncio.sleep(rem)
 
-            # --- PRE-BROADCAST PRICE GUARD & STAGE INTEGRITY VERIFICATION ---
-            target_price = expected_price_wei if expected_price_wei is not None else stage.price_wei
-            price_changed = False
-            new_price_wei = target_price
-            new_price_desc = ""
-
-            # Verification A: Fresh OpenSea Drop Metadata check
-            try:
-                fresh_coll = await self.opensea.fetch_collection(collection.slug, chain_client=active_chain)
-                fresh_stage = next(
-                    (s for s in fresh_coll.stages if s.uuid == stage.uuid or s.stage_index == stage.stage_index),
-                    None,
-                )
-                if fresh_stage is None and fresh_coll.stages:
-                    fresh_stage = fresh_coll.stages[0]
-
-                if fresh_stage and fresh_stage.price_wei != target_price:
-                    price_changed = True
-                    new_price_wei = fresh_stage.price_wei
-                    new_price_desc = f"{fresh_stage.price_unit} {fresh_stage.price_symbol} (~{fresh_stage.price_wei / 1e18:.6f} ETH)"
-            except Exception:
-                pass
-
-            # Verification B: Direct On-Chain SeaDrop Smart Contract Check
-            if not price_changed and stage.is_public:
-                try:
-                    onchain_price = await self.get_onchain_seadrop_price(active_chain, collection.contract_address)
-                    if onchain_price is not None and onchain_price != target_price:
-                        price_changed = True
-                        new_price_wei = onchain_price
-                        new_price_desc = f"{onchain_price / 1e18:.6f} ETH (On-Chain SeaDrop)"
-                except Exception:
-                    pass
-
-            # IF PRICE CHANGED: CANCEL TRANSACTION IMMEDIATELY & NEVER BROADCAST!
-            if price_changed:
-                approved_desc = f"{target_price / 1e18:.6f} ETH" if target_price > 0 else "0 ETH (FREE)"
-                alert_text = (
-                    "🚨 <b>PRICE CHANGE DETECTED — MINT ABORTED!</b>\n\n"
-                    "⚠️ <i>The collection developer modified the mint price!</i>\n"
-                    f"• <b>Approved Price:</b> <code>{approved_desc}</code>\n"
-                    f"• <b>New Detected Price:</b> <code>{new_price_desc}</code>\n\n"
-                    "🛡️ <b>Price Guard Triggered:</b> Transactions were <b>NEVER broadcasted</b>. Your funds are 100% safe!"
-                )
-                await notify(alert_text)
-                for r in results:
-                    r.status = "CANCELLED_PRICE_CHANGED"
-                    r.error_message = f"Price changed from {approved_desc} to {new_price_desc}"
-                return results
-
-            # 6. INSTANT PARALLEL BROADCAST!
-            await notify("⚡ T-0: FIRING ALL TRANSACTIONS SIMULTANEOUSLY! 🚀")
+            # 6. INSTANT PIPELINED BROADCAST (Zero synchronous network delay at T-0)
+            asyncio.create_task(notify("⚡ T-0: FIRING TRANSACTIONS TO RPC! 🚀"))
             broadcast_start = time.time()
 
-            broadcast_results = await active_chain.broadcast_batch(prepared_tx_bytes)
-            elapsed_ms = int((time.time() - broadcast_start) * 1000)
+            async def broadcast_presigned(w_addr: str, raw_bytes: bytes) -> None:
+                t0 = time.time()
+                r = next(res for res in results if res.wallet.address == w_addr)
+                try:
+                    await active_chain.broadcast_raw_transaction(raw_bytes)
+                    r.broadcast_time_ms = int((time.time() - t0) * 1000)
+                except Exception as ex:
+                    r.status = "FAILED"
+                    r.error_message = f"Broadcast failed: {ex}"
 
-            for r in results:
-                r.broadcast_time_ms = elapsed_ms
+            pipeline_sem = asyncio.Semaphore(3)
 
-            await notify(
-                f"✅ Broadcasted {len(prepared_tx_bytes)} transactions in <b>{elapsed_ms} ms</b>!\n"
-                f"Tracking receipts on-chain..."
-            )
+            async def pipeline_wallet(idx: int, w: WalletAccount) -> None:
+                r = next(res for res in results if res.wallet.address == w.address)
+                await asyncio.sleep(idx * 0.025)
+
+                async with pipeline_sem:
+                    try:
+                        act = await self.opensea.get_mint_action_hot(
+                            collection,
+                            w,
+                            quantity_per_wallet,
+                            stage,
+                            max_attempts=self.config.max_retry_attempts,
+                            retry_interval_ms=self.config.retry_interval_ms,
+                        )
+                    except Exception as ex:
+                        r.status = "FAILED"
+                        r.error_message = str(ex)
+                        return
+
+                # Safety Net: Price Guard checks
+                if expected_price_wei == 0 and act.value > 0:
+                    r.status = "CANCELLED_PAID_ON_FREE"
+                    r.error_message = f"Calldata required {act.value / 1e18:.6f} ETH on Free stage"
+                    return
+                if expected_price_wei is not None and act.value > (expected_price_wei * quantity_per_wallet):
+                    r.status = "CANCELLED_PRICE_EXCEEDED"
+                    r.error_message = f"Calldata value ({act.value}) exceeded expected ({expected_price_wei * quantity_per_wallet})"
+                    return
+
+                # Sign locally
+                nonce = nonces[w.address]
+                tx_dict = {
+                    "type": 2,
+                    "chainId": chain_id,
+                    "nonce": nonce,
+                    "maxPriorityFeePerGas": gas_fees.max_priority_fee_per_gas,
+                    "maxFeePerGas": gas_fees.max_fee_per_gas,
+                    "gas": self.config.gas_limit,
+                    "to": to_checksum_address(act.target),
+                    "value": act.value,
+                    "data": act.calldata,
+                }
+                raw_bytes, tx_hash = w.sign_transaction(tx_dict)
+                r.tx_hash = tx_hash
+                r.explorer_url = get_tx_explorer_url(chain_id, tx_hash)
+
+                # IMMEDIATELY BROADCAST this wallet's transaction!
+                t0 = time.time()
+                try:
+                    await active_chain.broadcast_raw_transaction(raw_bytes)
+                    r.broadcast_time_ms = int((time.time() - t0) * 1000)
+                except Exception as ex:
+                    r.status = "FAILED"
+                    r.error_message = f"Broadcast failed: {ex}"
+
+            # Dispatch all tasks concurrently
+            dispatch_tasks = []
+            for w_addr, raw_bytes in prepared_tx_map.items():
+                dispatch_tasks.append(broadcast_presigned(w_addr, raw_bytes))
+            for idx, w in enumerate(wallets_needing_t0):
+                dispatch_tasks.append(pipeline_wallet(idx, w))
+
+            if dispatch_tasks:
+                await asyncio.gather(*dispatch_tasks)
+
+            # Check if any price guard cancellation occurred
+            if any(r.status.startswith("CANCELLED") for r in results):
+                first_canc = next(r for r in results if r.status.startswith("CANCELLED"))
+                await notify(f"🚨 <b>PRICE GUARD ABORT:</b> {first_canc.error_message}")
+                return results
+
+            broadcasted = [r for r in results if r.tx_hash and not r.status.startswith("CANCELLED") and r.status != "FAILED"]
+            if broadcasted:
+                total_bcast_ms = int((time.time() - broadcast_start) * 1000)
+                asyncio.create_task(
+                    notify(f"✅ Dispatched {len(broadcasted)} transaction(s) in <b>{total_bcast_ms} ms</b>! Tracking receipts...")
+                )
 
             # 7. Concurrently Track Receipts with per-wallet timing
             async def track_receipt(r: WalletMintResult) -> None:
-                if not r.tx_hash:
+                if not r.tx_hash or r.status.startswith("CANCELLED") or r.status == "FAILED":
                     return
                 t0 = time.time()
                 try:
@@ -416,15 +444,17 @@ class MintEngine:
                             r.gas_used = rec.gas_used
                         else:
                             r.status = "REVERTED"
+                            r.error_message = "Transaction reverted on-chain (likely drop sold out)"
                     else:
                         r.status = "UNCONFIRMED"
+                        r.error_message = "Timeout waiting for on-chain receipt"
                 except Exception as ex:
                     r.confirm_time_seconds = round(time.time() - t0, 2)
                     r.total_time_seconds = round(time.time() - broadcast_start, 2)
                     r.status = "FAILED"
                     r.error_message = str(ex)
 
-            await asyncio.gather(*[track_receipt(r) for r in results if r.tx_hash])
+            await asyncio.gather(*[track_receipt(r) for r in results])
 
             total_elapsed = round(time.time() - broadcast_start, 2)
             success_count = sum(1 for r in results if r.status == "SUCCESS")
