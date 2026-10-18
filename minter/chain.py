@@ -48,6 +48,12 @@ class ChainClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
+    async def __aenter__(self) -> ChainClient:
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        await self.close()
+
     async def rpc_request(self, method: str, params: list[Any], use_fallback: bool = False) -> Any:
         url = self.fallback_rpc_url if (use_fallback and self.fallback_rpc_url) else self.rpc_url
         payload = {

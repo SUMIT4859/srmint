@@ -124,12 +124,13 @@ class TelegramBot:
             chain_info = get_chain_info(chain_id)
             chain_text = f"{chain_info['name']} (ID: {chain_id})"
         except Exception:
-            chain_text = f"RPC Connected ({self.config.rpc_url})"
+            chain_text = f"Robinhood ({self.config.rpc_url})"
 
         text = (
             "<b>🌊 OpenSea High-Speed Multi-Wallet Minter</b>\n\n"
             f"⚡ <b>Status:</b> Ready\n"
-            f"🔗 <b>Default Chain:</b> {chain_text}\n"
+            f"🔗 <b>Supported Chains:</b> Robinhood Chain (ID: 4663) & Ink (ID: 57073)\n"
+            f"⚡ <b>Default Route:</b> {chain_text}\n"
             f"💼 <b>Configured Wallets:</b> {wallet_count} wallet(s)\n"
             f"🚀 <b>Lead Broadcast:</b> {self.config.broadcast_lead_ms} ms\n\n"
             "<b>Quick Commands:</b>\n"
@@ -506,25 +507,29 @@ class TelegramBot:
             await self.send_message(chat_id, text)
             return
 
-        try:
-            chain_id = await self.chain.get_chain_id()
-            chain_info = get_chain_info(chain_id)
-            symbol = chain_info["symbol"]
-            chain_name = chain_info["name"]
-        except Exception:
-            chain_name = "Connected RPC"
-            symbol = "ETH"
-
         addresses = [w.address for w in wallets]
-        balances = await self.chain.get_balances_batch(addresses)
+        # Query Robinhood Chain balances
+        rb_balances = await self.chain.get_balances_batch(addresses)
 
-        lines = [f"💼 <b>Configured Wallets ({len(wallets)}):</b>", f"Network: {chain_name}\n"]
+        # Query Ink Chain balances concurrently
+        ink_balances = {}
+        try:
+            async with ChainClient(self.config.ink_rpc_url, fallback_rpc_url=self.config.ink_fallback_rpc_url, timeout_seconds=4.0) as ink_chain:
+                ink_balances = await ink_chain.get_balances_batch(addresses)
+        except Exception:
+            pass
+
+        lines = [
+            f"💼 <b>Configured Wallets ({len(wallets)}):</b>",
+            "<i>Dual-Chain Active: Robinhood Chain & Ink</i>\n",
+        ]
         for idx, w in enumerate(wallets):
-            bal = balances.get(w.address, 0) / 1e18
+            rb_bal = rb_balances.get(w.address, 0) / 1e18
+            ink_bal = ink_balances.get(w.address, 0) / 1e18
             lines.append(
-                f"<b>{idx+1}. {w.label}</b>\n"
-                f"   Address: <code>{w.address}</code>\n"
-                f"   Balance: <b>{bal:.5f} {symbol}</b>\n"
+                f"<b>{idx+1}. {w.label}</b> (<code>{w.short_address}</code>)\n"
+                f"   • <b>Robinhood:</b> <code>{rb_bal:.5f} ETH</code>\n"
+                f"   • <b>Ink:</b> <code>{ink_bal:.5f} ETH</code>\n"
             )
 
         lines.append("To delete a wallet: <code>/delwallet &lt;number&gt;</code>")
@@ -544,7 +549,7 @@ class TelegramBot:
 
         report = ["<b>🩺 Diagnostics Report:</b>\n"]
 
-        # 1. RPC Check
+        # 1. Robinhood RPC Check
         t0 = time.time()
         try:
             chain_id = await self.chain.get_chain_id()
@@ -554,14 +559,28 @@ class TelegramBot:
             chain_info = get_chain_info(chain_id)
             skew = abs(int(time.time()) - block_ts)
             report.append(
-                f"✅ <b>RPC Connected:</b> {chain_info['name']} (ID: {chain_id})\n"
+                f"✅ <b>Robinhood RPC:</b> {chain_info['name']} (ID: {chain_id})\n"
                 f"   Latency: <b>{rpc_ms} ms</b> | Latest Block: #{block_num}\n"
-                f"   Local Clock Skew: ~{skew}s\n"
+                f"   Clock Skew: ~{skew}s\n"
             )
         except Exception as e:
-            report.append(f"❌ <b>RPC Error:</b> {e}\n")
+            report.append(f"❌ <b>Robinhood RPC Error:</b> {e}\n")
 
-        # 2. OpenSea Connection Check
+        # 2. Ink RPC Check
+        t_ink = time.time()
+        try:
+            async with ChainClient(self.config.ink_rpc_url, fallback_rpc_url=self.config.ink_fallback_rpc_url, timeout_seconds=5.0) as ink_chain:
+                ink_id = await ink_chain.get_chain_id()
+                ink_block = await ink_chain.get_block_number()
+                ink_ms = int((time.time() - t_ink) * 1000)
+                report.append(
+                    f"✅ <b>Ink RPC:</b> Ink Mainnet (ID: {ink_id})\n"
+                    f"   Latency: <b>{ink_ms} ms</b> | Latest Block: #{ink_block}\n"
+                )
+        except Exception as e:
+            report.append(f"❌ <b>Ink RPC Error:</b> {e}\n")
+
+        # 3. OpenSea Connection Check
         t1 = time.time()
         try:
             client = await self.opensea.get_client()
@@ -586,7 +605,7 @@ class TelegramBot:
         except Exception as e:
             report.append(f"❌ <b>OpenSea Error:</b> {e}\n")
 
-        # 3. Wallets Check
+        # 4. Wallets Check
         w_count = self.wallets.count()
         report.append(f"💼 <b>Wallets Loaded:</b> {w_count} wallet(s)")
 
@@ -602,8 +621,9 @@ class TelegramBot:
 
         text = (
             "<b>⚙️ Current Bot Settings:</b>\n\n"
-            f"• <b>RPC Endpoint:</b> <code>{self.config.rpc_url}</code>\n"
-            f"• <b>Network:</b> {network_name}\n"
+            f"• <b>Robinhood RPC:</b> <code>{self.config.rpc_url}</code>\n"
+            f"• <b>Ink RPC:</b> <code>{self.config.ink_rpc_url}</code>\n"
+            f"• <b>Default Network:</b> {network_name}\n"
             f"• <b>Gas Limit:</b> {self.config.gas_limit}\n"
             f"• <b>Active Fee Multiplier:</b> {self.config.fee_multiplier}x\n"
             f"• <b>Scheduled Fee Multiplier:</b> {self.config.scheduled_fee_multiplier}x\n"

@@ -412,7 +412,7 @@ class OpenSeaClient:
             slug=contract_address.lower(),
             contract_address=checksummed,
             image_url="",
-            chain_identifier="robinhood" if chain_id == 4663 else "evm",
+            chain_identifier="robinhood" if chain_id == 4663 else ("ink" if chain_id == 57073 else "evm"),
             chain_id=chain_id,
             total_supply=0,
             max_supply=0,

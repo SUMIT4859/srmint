@@ -514,6 +514,35 @@ def test_pipelined_mint_engine_execution():
     asyncio.run(run_engine_test())
 
 
+def test_ink_chain_support():
+    from minter.constants import get_chain_info, get_tx_explorer_url
+    from minter.config import AppConfig
+
+    # 1. Chain constants
+    info = get_chain_info(57073)
+    assert info["name"] == "Ink"
+    assert info["symbol"] == "ETH"
+    assert "inkonchain.com" in info["explorer"]
+    assert "inkonchain.com" in info["default_rpc"]
+
+    # 2. Explorer URL
+    url = get_tx_explorer_url(57073, "0xabcdef123456")
+    assert url == "https://explorer.inkonchain.com/tx/0xabcdef123456"
+
+    # 3. Config multi-chain routing
+    cfg = AppConfig()
+    cfg.rpc_url = "https://custom-robinhood-rpc.com"
+    cfg.ink_rpc_url = "https://custom-ink-rpc.com"
+
+    # Robinhood routing
+    rb_rpc, rb_fb = cfg.get_rpc_for_chain(4663)
+    assert rb_rpc == "https://custom-robinhood-rpc.com"
+
+    # Ink routing
+    ink_rpc, ink_fb = cfg.get_rpc_for_chain(57073)
+    assert ink_rpc == "https://custom-ink-rpc.com"
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -530,6 +559,7 @@ if __name__ == "__main__":
     test_rate_limit_handling()
     test_single_attempt_stage_activation()
     test_pipelined_mint_engine_execution()
+    test_ink_chain_support()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

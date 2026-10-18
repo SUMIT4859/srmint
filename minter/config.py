@@ -17,6 +17,8 @@ class AppConfig:
     telegram_admin_id: int = 0
     rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
     fallback_rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
+    ink_rpc_url: str = "https://rpc-gel.inkonchain.com"
+    ink_fallback_rpc_url: str = "https://rpc-qnd.inkonchain.com"
     gas_limit: int = 250000
     fee_multiplier: float = 1.25
     scheduled_fee_multiplier: float = 2.0
@@ -27,6 +29,16 @@ class AppConfig:
     max_retry_attempts: int = 30
     retry_interval_ms: int = 250
     session_heartbeat_interval_seconds: int = 25
+
+    def get_rpc_for_chain(self, chain_id: int) -> tuple[str, str]:
+        """Return (primary_rpc, fallback_rpc) for the specified chain ID."""
+        if chain_id == 57073:
+            return (self.ink_rpc_url, self.ink_fallback_rpc_url)
+        if chain_id == 4663:
+            return (self.rpc_url, self.fallback_rpc_url)
+        from .constants import get_chain_info
+        info = get_chain_info(chain_id)
+        return (info.get("default_rpc", ""), info.get("fallback_rpc", ""))
 
     @classmethod
     def load(cls, config_path: str = "config.json") -> AppConfig:
@@ -52,6 +64,8 @@ class AppConfig:
 
         cfg.rpc_url = os.getenv("RPC_URL", cfg.rpc_url)
         cfg.fallback_rpc_url = os.getenv("FALLBACK_RPC_URL", cfg.fallback_rpc_url)
+        cfg.ink_rpc_url = os.getenv("INK_RPC_URL", cfg.ink_rpc_url)
+        cfg.ink_fallback_rpc_url = os.getenv("INK_FALLBACK_RPC_URL", cfg.ink_fallback_rpc_url)
 
         if os.getenv("GAS_LIMIT"):
             try:
@@ -76,6 +90,8 @@ class AppConfig:
             "telegram_admin_id": self.telegram_admin_id,
             "rpc_url": self.rpc_url,
             "fallback_rpc_url": self.fallback_rpc_url,
+            "ink_rpc_url": self.ink_rpc_url,
+            "ink_fallback_rpc_url": self.ink_fallback_rpc_url,
             "gas_limit": self.gas_limit,
             "fee_multiplier": self.fee_multiplier,
             "scheduled_fee_multiplier": self.scheduled_fee_multiplier,

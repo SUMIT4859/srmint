@@ -84,6 +84,14 @@ CHAINS = {
         "symbol": "ETH",
         "explorer": "https://robinhoodchain.blockscout.com",
         "default_rpc": "https://rpc.mainnet.chain.robinhood.com",
+        "fallback_rpc": "https://rpc.mainnet.chain.robinhood.com",
+    },
+    57073: {
+        "name": "Ink",
+        "symbol": "ETH",
+        "explorer": "https://explorer.inkonchain.com",
+        "default_rpc": "https://rpc-gel.inkonchain.com",
+        "fallback_rpc": "https://rpc-qnd.inkonchain.com",
     },
 }
 

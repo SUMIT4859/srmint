@@ -91,13 +91,19 @@ class MintEngine:
         chain_id = collection.chain_id
         if configured_chain_id != chain_id:
             chain_info = get_chain_info(chain_id)
-            default_rpc = chain_info.get("default_rpc")
-            if default_rpc:
+            target_rpc, target_fallback = self.config.get_rpc_for_chain(chain_id)
+            if not target_rpc:
+                target_rpc = chain_info.get("default_rpc", "")
+            if target_rpc:
                 await notify(
                     f"🔄 Auto-routing to <b>{chain_info['name']}</b> (Chain ID: {chain_id})\n"
-                    f"RPC: <code>{default_rpc}</code>"
+                    f"RPC: <code>{target_rpc}</code>"
                 )
-                active_chain = ChainClient(default_rpc, timeout_seconds=self.chain.timeout_seconds)
+                active_chain = ChainClient(
+                    target_rpc,
+                    fallback_rpc_url=target_fallback,
+                    timeout_seconds=self.chain.timeout_seconds,
+                )
                 should_close_active_chain = True
 
         is_public = stage.is_public
