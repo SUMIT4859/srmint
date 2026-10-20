@@ -36,12 +36,14 @@ def encode_public_mint(
     nft_contract: str,
     minter_recipient: str,
     quantity: int,
-    fee_recipient: str = OPENSEA_FEE_RECIPIENT,
+    fee_recipient: str | None = None,
 ) -> bytes:
     """Encode direct mintPublic(address,address,address,uint256) SeaDrop calldata.
     
     This executes 100% on-chain with zero GraphQL latency.
     """
+    if fee_recipient is None:
+        fee_recipient = OPENSEA_FEE_RECIPIENT
     args = [
         to_checksum_address(nft_contract),
         to_checksum_address(fee_recipient),

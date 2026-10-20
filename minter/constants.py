@@ -4,6 +4,7 @@ from eth_utils.address import to_checksum_address
 
 OPENSEA_SEADROP_ADDRESS = to_checksum_address("0x00005EA00Ac477B1030CE78506496e8C2dE24bf5")
 OPENSEA_FEE_RECIPIENT = to_checksum_address("0x0000a26b00c1F0DF003000390027140000fAa719")
+INK_FEE_RECIPIENT = to_checksum_address("0x07d3A100c3880830DD43Fe5C938b5144721cE9d6")
 MULTICALL3_ADDRESS = to_checksum_address("0xcA11bde05977b3631167028862bE2a173976CA11")
 
 # SeaDrop function selectors
@@ -85,6 +86,7 @@ CHAINS = {
         "explorer": "https://robinhoodchain.blockscout.com",
         "default_rpc": "https://rpc.mainnet.chain.robinhood.com",
         "fallback_rpc": "https://rpc.mainnet.chain.robinhood.com",
+        "fee_recipient": OPENSEA_FEE_RECIPIENT,
     },
     57073: {
         "name": "Ink",
@@ -92,6 +94,7 @@ CHAINS = {
         "explorer": "https://explorer.inkonchain.com",
         "default_rpc": "https://rpc-gel.inkonchain.com",
         "fallback_rpc": "https://rpc-qnd.inkonchain.com",
+        "fee_recipient": INK_FEE_RECIPIENT,
     },
 }
 
@@ -110,3 +113,28 @@ def get_tx_explorer_url(chain_id: int, tx_hash: str) -> str:
     explorer = get_chain_info(chain_id)["explorer"]
     return f"{explorer}/tx/{tx_hash}"
 
+def get_fee_recipient(chain_id: int) -> str:
+    info = get_chain_info(chain_id)
+    return info.get("fee_recipient", OPENSEA_FEE_RECIPIENT)
+
+
+SEADROP_ERROR_SELECTORS = {
+    "0xf477d26f": "FeeRecipientNotAllowed (Wrong fee recipient)",
+    "0x5136e8d5": "FeeRecipientCannotBeZeroAddress",
+    "0x3a4b9534": "MintQuantityCannotBeZero",
+    "0x6d0426f8": "MintQuantityExceedsMaxMintedPerWallet (Already minted maximum)",
+    "0x3a824151": "MintQuantityExceedsMaxSupply (Drop sold out)",
+    "0xd415a9ab": "NotActive (Drop stage not active)",
+    "0x61f95304": "IncorrectPayment (Price mismatch)",
+    "0xe651581a": "CreatorPaymentMethodNotAllowed",
+}
+
+
+def decode_seadrop_error(error_hex: str) -> str:
+    if not error_hex or not isinstance(error_hex, str):
+        return ""
+    err_lower = error_hex.lower()
+    for sel, name in SEADROP_ERROR_SELECTORS.items():
+        if sel in err_lower:
+            return name
+    return ""

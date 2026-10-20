@@ -16,7 +16,9 @@ from .config import AppConfig
 from .constants import (
     GET_PUBLIC_DROP_SELECTOR,
     OPENSEA_SEADROP_ADDRESS,
+    decode_seadrop_error,
     get_chain_info,
+    get_fee_recipient,
     get_tx_explorer_url,
 )
 from .seadrop import encode_public_mint
@@ -214,12 +216,14 @@ class MintEngine:
             wallets_needing_t0: list[WalletAccount] = []
 
             if is_public:
-                # Direct on-chain SeaDrop mintPublic: zero API delay, instant 100% pre-signed!
+                # Direct on-chain SeaDrop mintPublic with chain-specific fee recipient: zero API delay, instant 100% pre-signed!
+                fee_recipient = get_fee_recipient(chain_id)
                 for w in wallets:
                     cdata = encode_public_mint(
                         nft_contract=collection.contract_address,
                         minter_recipient=w.address,
                         quantity=quantity_per_wallet,
+                        fee_recipient=fee_recipient,
                     )
                     nonce = nonces[w.address]
                     val = stage.price_wei * quantity_per_wallet
@@ -459,7 +463,16 @@ class MintEngine:
                             r.gas_used = rec.gas_used
                         else:
                             r.status = "REVERTED"
-                            r.error_message = "Transaction reverted on-chain (likely drop sold out)"
+                            r.error_message = "Transaction reverted on-chain"
+                            # Attempt to diagnose exact on-chain error
+                            try:
+                                cdata_hex = "0x" + cdata_map.get(r.wallet.address, b"").hex() if "cdata_map" in locals() else ""
+                                if cdata_hex and cdata_hex != "0x":
+                                    call_res = await active_chain.call(to=OPENSEA_SEADROP_ADDRESS, data=cdata_hex)
+                            except Exception as sim_ex:
+                                d_err = decode_seadrop_error(str(sim_ex))
+                                if d_err:
+                                    r.error_message = f"Reverted: {d_err}" 
                     else:
                         r.status = "UNCONFIRMED"
                         r.error_message = "Timeout waiting for on-chain receipt"
