@@ -33,6 +33,7 @@ class WalletMintResult:
     gas_used: int = 0
     explorer_url: str = ""
     broadcast_time_ms: int = 0
+    calldata_time_ms: int = 0
     confirm_time_seconds: float = 0.0
     total_time_seconds: float = 0.0
 
@@ -361,6 +362,7 @@ class MintEngine:
                 r = next(res for res in results if res.wallet.address == w.address)
                 await asyncio.sleep(idx * 0.025)
 
+                t_call_start = time.time()
                 async with pipeline_sem:
                     try:
                         act = await self.opensea.get_mint_action_hot(
@@ -369,9 +371,11 @@ class MintEngine:
                             quantity_per_wallet,
                             stage,
                             max_attempts=self.config.max_retry_attempts,
-                            retry_interval_ms=self.config.retry_interval_ms,
+                            retry_interval_ms=120,
                         )
+                        r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                     except Exception as ex:
+                        r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                         r.status = "FAILED"
                         r.error_message = str(ex)
                         return
@@ -430,9 +434,14 @@ class MintEngine:
 
             broadcasted = [r for r in results if r.tx_hash and not r.status.startswith("CANCELLED") and r.status != "FAILED"]
             if broadcasted:
-                total_bcast_ms = int((time.time() - broadcast_start) * 1000)
+                max_bcast_ms = max((r.broadcast_time_ms for r in broadcasted), default=0)
+                max_calldata_ms = max((r.calldata_time_ms for r in broadcasted), default=0)
+                if max_calldata_ms > 0:
+                    summary_time = f"<b>{max_bcast_ms} ms</b> (OpenSea: {max_calldata_ms}ms | RPC: {max_bcast_ms}ms)"
+                else:
+                    summary_time = f"<b>{max_bcast_ms} ms</b>"
                 asyncio.create_task(
-                    notify(f"✅ Dispatched {len(broadcasted)} transaction(s) in <b>{total_bcast_ms} ms</b>! Tracking receipts...")
+                    notify(f"✅ Dispatched {len(broadcasted)} transaction(s) in {summary_time}! Tracking receipts...")
                 )
 
             # 7. Concurrently Track Receipts with per-wallet timing

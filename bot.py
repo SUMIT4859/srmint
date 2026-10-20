@@ -468,9 +468,13 @@ class TelegramBot:
 
         summary_lines = ["<b>📊 Final Mint Results:</b>"]
         if max_total_time > 0:
+            max_calldata_ms = max((getattr(r, "calldata_time_ms", 0) for r in results), default=0)
+            if max_calldata_ms > 0:
+                breakdown = f"OpenSea: {max_calldata_ms}ms | RPC: {broadcast_ms}ms | On-chain: {avg_confirm_time:.2f}s"
+            else:
+                breakdown = f"Broadcast: {broadcast_ms}ms | On-chain: {avg_confirm_time:.2f}s"
             summary_lines.append(
-                f"⏱️ <b>Total Time Taken:</b> <b>{max_total_time:.2f}s</b> "
-                f"(Broadcast: {broadcast_ms}ms | On-chain: {avg_confirm_time:.2f}s)\n"
+                f"⏱️ <b>Total Time Taken:</b> <b>{max_total_time:.2f}s</b> ({breakdown})\n"
             )
         else:
             summary_lines.append("\n")
