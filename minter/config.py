@@ -19,6 +19,8 @@ class AppConfig:
     fallback_rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
     ink_rpc_url: str = "https://rpc-gel.inkonchain.com"
     ink_fallback_rpc_url: str = "https://rpc-qnd.inkonchain.com"
+    eth_rpc_url: str = "https://ethereum-rpc.publicnode.com"
+    eth_fallback_rpc_url: str = "https://1rpc.io/eth"
     gas_limit: int = 250000
     fee_multiplier: float = 1.25
     scheduled_fee_multiplier: float = 2.0
@@ -32,6 +34,8 @@ class AppConfig:
 
     def get_rpc_for_chain(self, chain_id: int) -> tuple[str, str]:
         """Return (primary_rpc, fallback_rpc) for the specified chain ID."""
+        if chain_id == 1:
+            return (self.eth_rpc_url, self.eth_fallback_rpc_url)
         if chain_id == 57073:
             return (self.ink_rpc_url, self.ink_fallback_rpc_url)
         if chain_id == 4663:
@@ -66,6 +70,8 @@ class AppConfig:
         cfg.fallback_rpc_url = os.getenv("FALLBACK_RPC_URL", cfg.fallback_rpc_url)
         cfg.ink_rpc_url = os.getenv("INK_RPC_URL", cfg.ink_rpc_url)
         cfg.ink_fallback_rpc_url = os.getenv("INK_FALLBACK_RPC_URL", cfg.ink_fallback_rpc_url)
+        cfg.eth_rpc_url = os.getenv("ETH_RPC_URL", cfg.eth_rpc_url)
+        cfg.eth_fallback_rpc_url = os.getenv("ETH_FALLBACK_RPC_URL", cfg.eth_fallback_rpc_url)
 
         if os.getenv("GAS_LIMIT"):
             try:
@@ -92,6 +98,8 @@ class AppConfig:
             "fallback_rpc_url": self.fallback_rpc_url,
             "ink_rpc_url": self.ink_rpc_url,
             "ink_fallback_rpc_url": self.ink_fallback_rpc_url,
+            "eth_rpc_url": self.eth_rpc_url,
+            "eth_fallback_rpc_url": self.eth_fallback_rpc_url,
             "gas_limit": self.gas_limit,
             "fee_multiplier": self.fee_multiplier,
             "scheduled_fee_multiplier": self.scheduled_fee_multiplier,

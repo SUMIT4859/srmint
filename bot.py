@@ -129,7 +129,7 @@ class TelegramBot:
         text = (
             "<b>🌊 OpenSea High-Speed Multi-Wallet Minter</b>\n\n"
             f"⚡ <b>Status:</b> Ready\n"
-            f"🔗 <b>Supported Chains:</b> Robinhood Chain (ID: 4663) & Ink (ID: 57073)\n"
+            f"🔗 <b>Supported Chains:</b> Robinhood (4663), Ink (57073) & Ethereum (1)\n"
             f"⚡ <b>Default Route:</b> {chain_text}\n"
             f"💼 <b>Configured Wallets:</b> {wallet_count} wallet(s)\n"
             f"🚀 <b>Lead Broadcast:</b> {self.config.broadcast_lead_ms} ms\n\n"
@@ -515,25 +515,33 @@ class TelegramBot:
         # Query Robinhood Chain balances
         rb_balances = await self.chain.get_balances_batch(addresses)
 
-        # Query Ink Chain balances concurrently
-        ink_balances = {}
-        try:
-            async with ChainClient(self.config.ink_rpc_url, fallback_rpc_url=self.config.ink_fallback_rpc_url, timeout_seconds=4.0) as ink_chain:
-                ink_balances = await ink_chain.get_balances_batch(addresses)
-        except Exception:
-            pass
+        # Query Ink and Ethereum balances concurrently
+        async def fetch_chain_balances(rpc: str, fallback: str) -> dict:
+            try:
+                async with ChainClient(rpc, fallback_rpc_url=fallback, timeout_seconds=4.0) as cl:
+                    return await cl.get_balances_batch(addresses)
+            except Exception:
+                return {}
+
+        ink_balances, eth_balances = await asyncio.gather(
+            fetch_chain_balances(self.config.ink_rpc_url, self.config.ink_fallback_rpc_url),
+            fetch_chain_balances(self.config.eth_rpc_url, self.config.eth_fallback_rpc_url),
+            return_exceptions=False,
+        )
 
         lines = [
             f"💼 <b>Configured Wallets ({len(wallets)}):</b>",
-            "<i>Dual-Chain Active: Robinhood Chain & Ink</i>\n",
+            "<i>Multi-Chain Active: Robinhood, Ink & Ethereum</i>\n",
         ]
         for idx, w in enumerate(wallets):
             rb_bal = rb_balances.get(w.address, 0) / 1e18
             ink_bal = ink_balances.get(w.address, 0) / 1e18
+            eth_bal = eth_balances.get(w.address, 0) / 1e18
             lines.append(
                 f"<b>{idx+1}. {w.label}</b> (<code>{w.short_address}</code>)\n"
                 f"   • <b>Robinhood:</b> <code>{rb_bal:.5f} ETH</code>\n"
                 f"   • <b>Ink:</b> <code>{ink_bal:.5f} ETH</code>\n"
+                f"   • <b>Ethereum:</b> <code>{eth_bal:.5f} ETH</code>\n"
             )
 
         lines.append("To delete a wallet: <code>/delwallet &lt;number&gt;</code>")
@@ -584,7 +592,21 @@ class TelegramBot:
         except Exception as e:
             report.append(f"❌ <b>Ink RPC Error:</b> {e}\n")
 
-        # 3. OpenSea Connection Check
+        # 3. Ethereum RPC Check
+        t_eth = time.time()
+        try:
+            async with ChainClient(self.config.eth_rpc_url, fallback_rpc_url=self.config.eth_fallback_rpc_url, timeout_seconds=5.0) as eth_chain:
+                eth_id = await eth_chain.get_chain_id()
+                eth_block = await eth_chain.get_block_number()
+                eth_ms = int((time.time() - t_eth) * 1000)
+                report.append(
+                    f"✅ <b>Ethereum RPC:</b> Ethereum Mainnet (ID: {eth_id})\n"
+                    f"   Latency: <b>{eth_ms} ms</b> | Latest Block: #{eth_block}\n"
+                )
+        except Exception as e:
+            report.append(f"❌ <b>Ethereum RPC Error:</b> {e}\n")
+
+        # 4. OpenSea Connection Check
         t1 = time.time()
         try:
             client = await self.opensea.get_client()
@@ -609,7 +631,7 @@ class TelegramBot:
         except Exception as e:
             report.append(f"❌ <b>OpenSea Error:</b> {e}\n")
 
-        # 4. Wallets Check
+        # 5. Wallets Check
         w_count = self.wallets.count()
         report.append(f"💼 <b>Wallets Loaded:</b> {w_count} wallet(s)")
 
@@ -627,6 +649,7 @@ class TelegramBot:
             "<b>⚙️ Current Bot Settings:</b>\n\n"
             f"• <b>Robinhood RPC:</b> <code>{self.config.rpc_url}</code>\n"
             f"• <b>Ink RPC:</b> <code>{self.config.ink_rpc_url}</code>\n"
+            f"• <b>Ethereum RPC:</b> <code>{self.config.eth_rpc_url}</code>\n"
             f"• <b>Default Network:</b> {network_name}\n"
             f"• <b>Gas Limit:</b> {self.config.gas_limit}\n"
             f"• <b>Active Fee Multiplier:</b> {self.config.fee_multiplier}x\n"

@@ -36,7 +36,9 @@ CHAINS = {
         "name": "Ethereum Mainnet",
         "symbol": "ETH",
         "explorer": "https://etherscan.io",
-        "default_rpc": "https://eth.llamarpc.com",
+        "default_rpc": "https://ethereum-rpc.publicnode.com",
+        "fallback_rpc": "https://1rpc.io/eth",
+        "fee_recipient": OPENSEA_FEE_RECIPIENT,
     },
     8453: {
         "name": "Base",

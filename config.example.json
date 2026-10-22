@@ -5,6 +5,8 @@
   "fallback_rpc_url": "https://base.llamarpc.com",
   "ink_rpc_url": "https://rpc-gel.inkonchain.com",
   "ink_fallback_rpc_url": "https://rpc-qnd.inkonchain.com",
+  "eth_rpc_url": "https://ethereum-rpc.publicnode.com",
+  "eth_fallback_rpc_url": "https://1rpc.io/eth",
   "gas_limit": 300000,
   "fee_multiplier": 1.25,
   "scheduled_fee_multiplier": 2.0,

@@ -543,6 +543,42 @@ def test_ink_chain_support():
     assert ink_rpc == "https://custom-ink-rpc.com"
 
 
+def test_ethereum_chain_support():
+    from minter.constants import get_chain_info, get_tx_explorer_url, get_fee_recipient, OPENSEA_FEE_RECIPIENT
+    from minter.config import AppConfig
+
+    # 1. Chain constants
+    info = get_chain_info(1)
+    assert info["name"] == "Ethereum Mainnet"
+    assert info["symbol"] == "ETH"
+    assert info["explorer"] == "https://etherscan.io"
+    assert "publicnode.com" in info["default_rpc"]
+
+    # 2. Explorer URL
+    url = get_tx_explorer_url(1, "0x1234567890abcdef")
+    assert url == "https://etherscan.io/tx/0x1234567890abcdef"
+
+    # 3. SeaDrop Fee Recipient (must match OpenSea Fee Recipient on Ethereum to prevent FeeRecipientNotAllowed)
+    fee_recipient = get_fee_recipient(1)
+    assert fee_recipient == OPENSEA_FEE_RECIPIENT
+    assert fee_recipient.lower() == "0x0000a26b00c1f0df003000390027140000faa719"
+
+    # 4. Config multi-chain routing
+    cfg = AppConfig()
+    cfg.eth_rpc_url = "https://custom-eth-rpc.com"
+    cfg.eth_fallback_rpc_url = "https://custom-eth-fallback.com"
+
+    eth_rpc, eth_fb = cfg.get_rpc_for_chain(1)
+    assert eth_rpc == "https://custom-eth-rpc.com"
+    assert eth_fb == "https://custom-eth-fallback.com"
+
+    # 5. Robinhood and Ink routing remain 100% intact
+    rb_rpc, _ = cfg.get_rpc_for_chain(4663)
+    ink_rpc, _ = cfg.get_rpc_for_chain(57073)
+    assert rb_rpc == cfg.rpc_url
+    assert ink_rpc == cfg.ink_rpc_url
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -560,6 +596,7 @@ if __name__ == "__main__":
     test_single_attempt_stage_activation()
     test_pipelined_mint_engine_execution()
     test_ink_chain_support()
+    test_ethereum_chain_support()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

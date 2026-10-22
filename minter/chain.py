@@ -141,20 +141,33 @@ class ChainClient:
             base_fee = int(block["baseFeePerGas"], 16)
 
         priority_fee_wei = int(priority_fee_gwei * 1e9)
-        # On Robinhood Chain, base fee is only ~0.02 Gwei.
-        # If user has an old Ethereum-scale priority fee (> base_fee), clamp it so it doesn't inflate fees by 75x!
-        if priority_fee_wei > base_fee:
-            max_priority = max(100_000, int(base_fee * 0.1))
+        chain_id = await self.get_chain_id()
+        if chain_id == 1:
+            # Ethereum Mainnet (L1): miner tip must not be sub-satoshi to prevent mempool stalling.
+            min_eth_tip = 500_000_000  # 0.5 Gwei minimum tip
+            if isinstance(priority_res, str):
+                try:
+                    rpc_priority = int(priority_res, 16)
+                    if rpc_priority > 0:
+                        min_eth_tip = max(min_eth_tip, rpc_priority)
+                except ValueError:
+                    pass
+            max_priority = max(min_eth_tip, priority_fee_wei)
         else:
-            max_priority = max(100_000, priority_fee_wei)
+            # On L2 chains (Robinhood Chain, Ink), base fee is only ~0.001-0.02 Gwei.
+            # If user has an old Ethereum-scale priority fee (> base_fee), clamp it so it doesn't inflate fees by 75x!
+            if priority_fee_wei > base_fee:
+                max_priority = max(100_000, int(base_fee * 0.1))
+            else:
+                max_priority = max(100_000, priority_fee_wei)
 
-        if isinstance(priority_res, str):
-            try:
-                rpc_priority = int(priority_res, 16)
-                if 0 < rpc_priority <= base_fee:
-                    max_priority = max(max_priority, rpc_priority)
-            except ValueError:
-                pass
+            if isinstance(priority_res, str):
+                try:
+                    rpc_priority = int(priority_res, 16)
+                    if 0 < rpc_priority <= base_fee:
+                        max_priority = max(max_priority, rpc_priority)
+                except ValueError:
+                    pass
 
         adjusted_base_fee = int(base_fee * fee_multiplier)
         max_fee = adjusted_base_fee + max_priority
