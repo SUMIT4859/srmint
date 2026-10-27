@@ -337,14 +337,27 @@ class MintEngine:
                 else:
                     await notify(f"⏳ Calldata will unlock at T-0. Pipelined workers ready for {len(wallets_needing_t0)} wallet(s).")
 
-            # 5. High-Precision Countdown to T-0 with Lead Offset Compensation
+            # 5. High-Precision Countdown to T-0 with RPC Pre-Warmup & Lead Offset Compensation
             if target_start_ts > time.time():
                 lead_seconds = self.config.broadcast_lead_ms / 1000.0
                 target_broadcast_time = target_start_ts - lead_seconds
 
                 rem = target_broadcast_time - time.time()
-                if rem > 0:
-                    await asyncio.sleep(rem)
+                # If countdown is long enough, sleep until T-1.5s then pulse warm RPC sockets
+                if rem > 1.8:
+                    await asyncio.sleep(rem - 1.5)
+                    # Warmup both primary and fallback RPC connections so TCP/TLS handshakes are hot for T-0!
+                    try:
+                        tasks = [active_chain.rpc_request("eth_blockNumber", [])]
+                        if active_chain.fallback_rpc_url and active_chain.fallback_rpc_url != active_chain.rpc_url:
+                            tasks.append(active_chain.rpc_request("eth_blockNumber", [], use_fallback=True))
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                    except Exception:
+                        pass
+
+                rem_final = target_broadcast_time - time.time()
+                if rem_final > 0:
+                    await asyncio.sleep(rem_final)
 
             # 6. INSTANT PIPELINED BROADCAST (Zero synchronous network delay at T-0)
             asyncio.create_task(notify("⚡ T-0: FIRING TRANSACTIONS TO RPC! 🚀"))
@@ -360,11 +373,11 @@ class MintEngine:
                     r.status = "FAILED"
                     r.error_message = f"Broadcast failed: {ex}"
 
-            pipeline_sem = asyncio.Semaphore(3)
+            pipeline_sem = asyncio.Semaphore(10)
 
             async def pipeline_wallet(idx: int, w: WalletAccount) -> None:
                 r = next(res for res in results if res.wallet.address == w.address)
-                await asyncio.sleep(idx * 0.025)
+                await asyncio.sleep(idx * 0.015)
 
                 t_call_start = time.time()
                 async with pipeline_sem:
@@ -375,7 +388,7 @@ class MintEngine:
                             quantity_per_wallet,
                             stage,
                             max_attempts=self.config.max_retry_attempts,
-                            retry_interval_ms=120,
+                            retry_interval_ms=50,
                         )
                         r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                     except Exception as ex:
@@ -441,7 +454,8 @@ class MintEngine:
                 max_bcast_ms = max((r.broadcast_time_ms for r in broadcasted), default=0)
                 max_calldata_ms = max((r.calldata_time_ms for r in broadcasted), default=0)
                 if max_calldata_ms > 0:
-                    summary_time = f"<b>{max_bcast_ms} ms</b> (OpenSea: {max_calldata_ms}ms | RPC: {max_bcast_ms}ms)"
+                    total_dispatch_ms = max_calldata_ms + max_bcast_ms
+                    summary_time = f"<b>{total_dispatch_ms} ms</b> (OpenSea: {max_calldata_ms}ms | RPC: {max_bcast_ms}ms)"
                 else:
                     summary_time = f"<b>{max_bcast_ms} ms</b>"
                 asyncio.create_task(

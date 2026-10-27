@@ -221,6 +221,21 @@ class TelegramBot:
 
         # Check eligibility upfront for private/allowlist stages
         eligibility_cache = session.setdefault("eligibility_cache", {})
+
+        # Concurrently pre-fetch eligibility for all uncached wallets in parallel (populates all stages!)
+        if not stage.is_public:
+            uncached = [w for w in all_configured_wallets if (stage.uuid, w.address) not in eligibility_cache]
+            if uncached:
+                async def fetch_one(w: WalletAccount):
+                    try:
+                        all_stage_map = await self.opensea.check_wallet_eligibility_all_stages(coll, w)
+                        for s_uuid, el in all_stage_map.items():
+                            eligibility_cache[(s_uuid, w.address)] = el
+                    except Exception:
+                        eligibility_cache[(stage.uuid, w.address)] = WalletEligibility(False, reason="Check Failed")
+
+                await asyncio.gather(*(fetch_one(w) for w in uncached))
+
         wallet_lines = []
         for idx, w in enumerate(all_configured_wallets):
             icon = "✅" if w.address in selected_addrs else "⬜"
@@ -233,13 +248,7 @@ class TelegramBot:
                 badge = f"🟢 Public | {price_str}"
             else:
                 cache_key = (stage.uuid, w.address)
-                if cache_key not in eligibility_cache:
-                    try:
-                        elig = await self.opensea.check_wallet_eligibility(coll, stage, w)
-                        eligibility_cache[cache_key] = elig
-                    except Exception:
-                        eligibility_cache[cache_key] = WalletEligibility(False, reason="Check Failed")
-                elig: WalletEligibility = eligibility_cache[cache_key]
+                elig: WalletEligibility = eligibility_cache.get(cache_key) or WalletEligibility(False, reason="Not on Allowlist")
                 if elig.is_eligible:
                     price_str = elig.format_price(eth_usd_rate)
                     if elig.is_free:
@@ -356,6 +365,17 @@ class TelegramBot:
             valid_wallets = []
             ineligible_wallets = []
             wallet_eligs: dict[str, WalletEligibility] = {}
+
+            uncached = [w for w in wallets if (stage.uuid, w.address) not in session.get("eligibility_cache", {})]
+            if uncached:
+                async def fetch_missing(w: WalletAccount):
+                    try:
+                        all_m = await self.opensea.check_wallet_eligibility_all_stages(coll, w)
+                        for s_u, el in all_m.items():
+                            session.setdefault("eligibility_cache", {})[(s_u, w.address)] = el
+                    except Exception:
+                        pass
+                await asyncio.gather(*(fetch_missing(w) for w in uncached))
 
             for w in wallets:
                 cache_key = (stage.uuid, w.address)

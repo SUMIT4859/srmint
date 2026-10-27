@@ -185,6 +185,62 @@ class ChainClient:
 
     async def broadcast_raw_transaction(self, raw_tx: bytes) -> str:
         hex_data = f"0x{raw_tx.hex()}"
+
+        # If fallback RPC is available, race BOTH endpoints in parallel (Hedged Dual-RPC Broadcast)
+        # to ensure zero delays from single-endpoint lag, mempool queuing, or rate-limits!
+        if self.fallback_rpc_url and self.fallback_rpc_url != self.rpc_url:
+            async def send_to(endpoint_url: str) -> str:
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": int(time.time() * 1000) % 1000000,
+                    "method": "eth_sendRawTransaction",
+                    "params": [hex_data],
+                }
+                client = await self.get_client()
+                resp = await client.post(endpoint_url, json=payload, headers={"Content-Type": "application/json"})
+                resp.raise_for_status()
+                data = resp.json()
+                if "error" in data:
+                    err = data["error"]
+                    msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                    err_str = msg.lower()
+                    if "already known" in err_str or "nonce too low" in err_str:
+                        return f"broadcasted ({msg})"
+                    raise RuntimeError(f"RPC Error [{endpoint_url}]: {msg}")
+                res = data.get("result")
+                if not res:
+                    raise RuntimeError(f"Empty result from {endpoint_url}")
+                return res
+
+            tasks = [
+                asyncio.create_task(send_to(self.rpc_url)),
+                asyncio.create_task(send_to(self.fallback_rpc_url)),
+            ]
+
+            errors: list[Exception] = []
+            for fut in asyncio.as_completed(tasks):
+                try:
+                    res = await fut
+                    if res:
+                        # Cancel slower endpoint immediately
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+                        return res
+                except Exception as ex:
+                    errors.append(ex)
+
+            # Check if any response was benign (already in mempool)
+            for err in errors:
+                err_str = str(err).lower()
+                if "already known" in err_str or "nonce too low" in err_str:
+                    return f"broadcasted ({err})"
+
+            if errors:
+                raise errors[0]
+            raise RuntimeError("Broadcast failed on all endpoints")
+
+        # Single RPC endpoint fallback
         try:
             res = await self.rpc_request("eth_sendRawTransaction", [hex_data])
             return res

@@ -579,6 +579,133 @@ def test_ethereum_chain_support():
     assert ink_rpc == cfg.ink_rpc_url
 
 
+def test_hedged_broadcast_dual_rpc():
+    import asyncio
+    from unittest.mock import AsyncMock, patch
+    from minter.chain import ChainClient
+
+    async def run_test():
+        client = ChainClient("https://primary-rpc.com", fallback_rpc_url="https://fallback-rpc.com")
+        
+        # Mock httpx client
+        mock_http = AsyncMock()
+        
+        async def mock_post(url, json=None, headers=None):
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            if url == "https://primary-rpc.com":
+                # Primary RPC is slow (simulating 2s lag/hang)
+                await asyncio.sleep(0.5)
+                resp.json = lambda: {"result": "0xprimary"}
+            else:
+                # Fallback RPC responds instantly in 10ms!
+                await asyncio.sleep(0.01)
+                resp.json = lambda: {"result": "0xfast_fallback"}
+            return resp
+
+        mock_http.post = mock_post
+        client.get_client = AsyncMock(return_value=mock_http)
+
+        # Broadcast should take ~0.01s, winning with the fallback RPC result
+        tx_hash = await client.broadcast_raw_transaction(b"\x02\x01\x02")
+        assert tx_hash == "0xfast_fallback"
+
+    asyncio.run(run_test())
+
+
+def test_check_wallet_eligibility_all_stages():
+    import asyncio
+    from unittest.mock import AsyncMock
+    from minter.client import OpenSeaClient, CollectionInfo, DropStage
+    from minter.wallet import WalletAccount
+
+    async def run_test():
+        os_client = OpenSeaClient()
+        w = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001")
+        
+        stage1 = DropStage(
+            uuid="uuid-1",
+            label="Public",
+            stage_type="PUBLIC_SALE",
+            stage_index=0,
+            start_time="now",
+            end_time="later",
+            start_timestamp=100,
+            end_timestamp=200,
+            max_per_wallet=2,
+            price_wei=0,
+            price_symbol="ETH",
+            price_unit=0.0,
+        )
+        stage2 = DropStage(
+            uuid="uuid-2",
+            label="Allowlist",
+            stage_type="SIGNED_PRESALE",
+            stage_index=1,
+            start_time="now",
+            end_time="later",
+            start_timestamp=100,
+            end_timestamp=200,
+            max_per_wallet=1,
+            price_wei=10000000000000000,
+            price_symbol="ETH",
+            price_unit=0.01,
+        )
+        coll = CollectionInfo(
+            name="Test Coll",
+            slug="test-coll",
+            contract_address="0x0000000000000000000000000000000000000000",
+            image_url="",
+            chain_identifier="robinhood",
+            chain_id=4663,
+            total_supply=100,
+            max_supply=100,
+            stages=[stage1, stage2],
+        )
+
+        mock_http = AsyncMock()
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.json = lambda: {
+            "data": {
+                "dropBySlug": {
+                    "accountStageEligibility": {
+                        "wallets": [
+                            {
+                                "address": w.address.lower(),
+                                "stages": [
+                                    {
+                                        "dropStageUuid": "uuid-2",
+                                        "isEligible": True,
+                                        "price": {"token": {"unit": 0.01, "symbol": "ETH"}},
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    "stages": []
+                }
+            }
+        }
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        os_client.get_wallet_client = AsyncMock(return_value=mock_http)
+        os_client.authenticate_wallet = AsyncMock()
+
+        # Query all stages
+        all_eligs = await os_client.check_wallet_eligibility_all_stages(coll, w)
+        assert "uuid-1" in all_eligs
+        assert all_eligs["uuid-1"].is_eligible is True
+        assert "uuid-2" in all_eligs
+        assert all_eligs["uuid-2"].is_eligible is True
+        assert all_eligs["uuid-2"].price_unit == 0.01
+
+        # Second query hits local memory cache immediately
+        cached_eligs = await os_client.check_wallet_eligibility_all_stages(coll, w)
+        assert cached_eligs is all_eligs
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -597,6 +724,8 @@ if __name__ == "__main__":
     test_pipelined_mint_engine_execution()
     test_ink_chain_support()
     test_ethereum_chain_support()
+    test_hedged_broadcast_dual_rpc()
+    test_check_wallet_eligibility_all_stages()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))
