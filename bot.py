@@ -245,16 +245,18 @@ class TelegramBot:
                 else:
                     usd = stage.price_unit * eth_usd_rate
                     price_str = f"💎 {stage.price_unit:.6g} {stage.price_symbol} (~${usd:.2f})"
-                badge = f"🟢 Public | {price_str}"
+                alloc_note = f" (Max: {stage.max_per_wallet})" if stage.max_per_wallet > 1 else ""
+                badge = f"🟢 Public | {price_str}{alloc_note}"
             else:
                 cache_key = (stage.uuid, w.address)
                 elig: WalletEligibility = eligibility_cache.get(cache_key) or WalletEligibility(False, reason="Not on Allowlist")
                 if elig.is_eligible:
                     price_str = elig.format_price(eth_usd_rate)
+                    alloc_note = f" (Max: {elig.max_mintable})" if elig.max_mintable > 1 else ""
                     if elig.is_free:
-                        badge = f"🟢 Eligible | 🟢 {price_str}"
+                        badge = f"🟢 Eligible | 🟢 {price_str}{alloc_note}"
                     else:
-                        badge = f"🟢 Eligible | ⚠️ <b>{price_str}</b>"
+                        badge = f"🟢 Eligible | ⚠️ <b>{price_str}</b>{alloc_note}"
                 else:
                     badge = f"🔴 Not Eligible ({elig.reason})"
 
@@ -452,6 +454,34 @@ class TelegramBot:
                 )
                 return
 
+        # Determine each wallet's optimal eligible mint quantity (up to requested qty)
+        wallet_quantities: dict[str, int] = {}
+        qty_variations: list[str] = []
+        for w in wallets:
+            if not stage.is_public:
+                w_elig = wallet_eligs.get(w.address)
+                if w_elig and w_elig.is_eligible and w_elig.max_mintable > 0:
+                    w_qty = min(qty, w_elig.max_mintable)
+                else:
+                    stage_max = stage.max_per_wallet if stage.max_per_wallet > 0 else qty
+                    w_qty = min(qty, stage_max)
+            else:
+                stage_max = stage.max_per_wallet if stage.max_per_wallet > 0 else qty
+                w_qty = min(qty, stage_max)
+
+            w_qty = max(1, w_qty)
+            wallet_quantities[w.address] = w_qty
+            if w_qty != qty:
+                qty_variations.append(f"{w.label} (Qty: {w_qty})")
+
+        if qty_variations:
+            note_str = ", ".join(qty_variations)
+            await self.send_message(
+                chat_id,
+                f"💡 <b>Dynamic Allocation Active:</b> Wallets configured to their maximum eligible amount:\n"
+                f"• {note_str} (Requested: {qty})",
+            )
+
         async def on_progress(status_text: str) -> None:
             await self.send_message(chat_id, status_text)
 
@@ -462,6 +492,7 @@ class TelegramBot:
             stage=stage,
             wallets=wallets,
             quantity_per_wallet=qty,
+            wallet_quantities=wallet_quantities,
             expected_price_wei=expected_price_wei,
             on_progress=on_progress,
         )
@@ -501,7 +532,8 @@ class TelegramBot:
 
         for r in results:
             icon = "✅" if r.status == "SUCCESS" else ("❌" if r.status == "FAILED" else "⚠️")
-            line = f"{icon} <b>{r.wallet.label}</b> ({r.wallet.short_address}): {r.status}"
+            qty_tag = f" (Qty: {r.quantity})" if r.quantity > 0 else ""
+            line = f"{icon} <b>{r.wallet.label}</b> ({r.wallet.short_address}): {r.status}{qty_tag}"
             if r.tx_hash:
                 line += f"\n   Tx: <a href='{r.explorer_url}'>{r.tx_hash[:10]}...{r.tx_hash[-8:]}</a>"
             details = []

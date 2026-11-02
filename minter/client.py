@@ -178,6 +178,7 @@ class MintAction:
     target: str
     value: int
     calldata: bytes
+    quantity: int = 1
 
 
 @dataclass
@@ -187,6 +188,7 @@ class WalletEligibility:
     price_unit: float = 0.0
     price_symbol: str = "ETH"
     reason: str = ""
+    max_mintable: int = 1
 
     @property
     def is_free(self) -> bool:
@@ -705,7 +707,8 @@ class OpenSeaClient:
                             else:
                                 val = int(val_raw)
                             calldata = bytes.fromhex(sub_data["data"].lstrip("0x"))
-                            return MintAction(target=target, value=val, calldata=calldata)
+                            actual_qty = int(variables["toAssets"][0]["quantity"])
+                            return MintAction(target=target, value=val, calldata=calldata, quantity=actual_qty)
 
                     swap_errors = swap.get("errors", [])
                     if swap_errors:
@@ -717,9 +720,17 @@ class OpenSeaClient:
                             # If target stage has not started yet or within transition window, wait for activation
                             if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
                                 last_err = RuntimeError("Waiting for OpenSea stage activation...")
+                                # Rapid 35ms poll during activation window to grab calldata immediately when live!
+                                await asyncio.sleep(0.035)
+                                continue
                             else:
                                 raise RuntimeError("Wallet is not on the Allowlist for this stage")
                         elif "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
+                            # Dynamic allocation fallback: If quantity > 1, immediately retry with decremented quantity!
+                            current_q = int(variables["toAssets"][0]["quantity"])
+                            if current_q > 1:
+                                variables["toAssets"][0]["quantity"] = str(current_q - 1)
+                                continue
                             raise RuntimeError("Allocation limit exceeded for this wallet")
                         else:
                             last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
@@ -768,6 +779,7 @@ class OpenSeaClient:
                     price_unit=st.price_unit,
                     price_symbol=st.price_symbol,
                     reason="Eligible (Public Sale)",
+                    max_mintable=st.max_per_wallet or 1,
                 )
 
         # Ensure wallet has an active SIWE session (cached, runs at most once per session)
@@ -817,6 +829,7 @@ class OpenSeaClient:
 
                 for w_info in wallets_list:
                     if w_info.get("address", "").lower() == wallet.address.lower():
+                        qty_minted = int(w_info.get("quantityMinted") or 0)
                         for st_info in w_info.get("stages", []):
                             u = st_info.get("dropStageUuid", "")
                             matching_stage = next((s for s in collection.stages if s.uuid == u), None)
@@ -826,7 +839,29 @@ class OpenSeaClient:
                             if u in top_stage_prices:
                                 fb_unit, fb_sym, fb_wei = top_stage_prices[u]
 
+                            # Determine max mintable
+                            max_total = st_info.get("maxTotalMintableByWallet")
+                            if max_total is None:
+                                top_st = next((s for s in stages_list if s.get("uuid") == u), None)
+                                if top_st:
+                                    max_total = top_st.get("eligibleMaxTotalMintableByWallet") or top_st.get("maxTotalMintableByWallet")
+                            if max_total is None and matching_stage:
+                                max_total = matching_stage.max_per_wallet
+                            max_total_int = int(max_total or 1)
+                            remaining_mintable = max(0, max_total_int - qty_minted)
+
                             if st_info.get("isEligible") is True:
+                                if remaining_mintable == 0:
+                                    results[u] = WalletEligibility(
+                                        is_eligible=False,
+                                        price_wei=0,
+                                        price_unit=0.0,
+                                        price_symbol="ETH",
+                                        reason="Already minted maximum allocation",
+                                        max_mintable=0,
+                                    )
+                                    continue
+
                                 p_tok = (st_info.get("price") or {}).get("token") or {}
                                 if p_tok.get("unit") is not None:
                                     p_unit = float(p_tok.get("unit") or 0.0)
@@ -840,6 +875,7 @@ class OpenSeaClient:
                                     price_unit=p_unit,
                                     price_symbol=p_sym,
                                     reason="Eligible (Allowlist Verified)",
+                                    max_mintable=max(1, remaining_mintable),
                                 )
                             elif st_info.get("isEligible") is False:
                                 results[u] = WalletEligibility(
@@ -848,6 +884,7 @@ class OpenSeaClient:
                                     price_unit=0.0,
                                     price_symbol="ETH",
                                     reason="Not on Allowlist",
+                                    max_mintable=0,
                                 )
 
                 # Fallback to top-level stages array if any stage was not in wallets_list
@@ -925,6 +962,7 @@ class OpenSeaClient:
                 price_unit=stage.price_unit,
                 price_symbol=stage.price_symbol,
                 reason="Eligible (Public Sale)",
+                max_mintable=stage.max_per_wallet or 1,
             )
 
         all_eligs = await self.check_wallet_eligibility_all_stages(collection, wallet)

@@ -706,6 +706,171 @@ def test_check_wallet_eligibility_all_stages():
     asyncio.run(run_test())
 
 
+def test_differing_quantities_no_cancellation():
+    import asyncio
+    from unittest.mock import AsyncMock
+    from minter.engine import MintEngine
+    from minter.client import CollectionInfo, DropStage, MintAction
+    from minter.wallet import WalletAccount
+    from minter.config import AppConfig
+
+    async def run_test():
+        cfg = AppConfig()
+        mock_chain = AsyncMock()
+        mock_chain.get_chain_id = AsyncMock(return_value=4663)
+        mock_chain.get_balances_batch = AsyncMock(return_value={"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf": 10**18, "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF": 10**18})
+        mock_chain.get_nonces_batch = AsyncMock(return_value={"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf": 0, "0x2B5AD5c4795c026514f8317c7a215E218DcCD6cF": 1})
+        mock_gas = AsyncMock()
+        mock_gas.max_priority_fee_per_gas = 1000000
+        mock_gas.max_fee_per_gas = 20000000
+        mock_chain.get_gas_fees = AsyncMock(return_value=mock_gas)
+        mock_chain.broadcast_raw_transaction = AsyncMock(return_value="0xtx123")
+        mock_receipt = AsyncMock()
+        mock_receipt.status = 1
+        mock_receipt.gas_used = 120000
+        mock_chain.wait_for_receipt = AsyncMock(return_value=mock_receipt)
+
+        mock_opensea = AsyncMock()
+        mock_opensea.authenticate_all_wallets = AsyncMock()
+        mock_opensea.stop_heartbeat = lambda: None
+
+        # Wallet 1 mints 3 NFTs at 0.01 ETH each (total value = 0.03 ETH)
+        # Wallet 2 mints 1 NFT at 0.01 ETH each (total value = 0.01 ETH)
+        async def mock_get_mint_action(coll, w, qty, stage, **kwargs):
+            val = qty * 10000000000000000
+            return MintAction(
+                target="0x00005EA00Ac477B1030CE78506496e8C2dE24bf5",
+                value=val,
+                calldata=b"\x12\x34",
+                quantity=qty,
+            )
+        mock_opensea.get_mint_action_hot = mock_get_mint_action
+
+        w1 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001", label="W1")
+        w2 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000002", label="W2")
+
+        stage = DropStage(
+            uuid="allowlist-1",
+            label="Allowlist",
+            stage_type="SIGNED_PRESALE",
+            stage_index=0,
+            start_time="",
+            end_time="",
+            start_timestamp=0,  # Live stage
+            end_timestamp=2147483647,
+            max_per_wallet=3,
+            price_wei=10000000000000000,
+            price_symbol="ETH",
+            price_unit=0.01,
+        )
+
+        coll = CollectionInfo(
+            name="Multi-Qty Collection",
+            slug="multi-qty-coll",
+            contract_address="0x1111111111111111111111111111111111111111",
+            image_url="",
+            chain_identifier="robinhood",
+            chain_id=4663,
+            total_supply=100,
+            max_supply=100,
+            stages=[stage],
+        )
+
+        engine = MintEngine(cfg, chain=mock_chain, opensea=mock_opensea)
+
+        # W1 has 3, W2 has 1
+        wallet_quantities = {w1.address: 3, w2.address: 1}
+
+        results = await engine.execute_mint(
+            collection=coll,
+            stage=stage,
+            wallets=[w1, w2],
+            quantity_per_wallet=3,
+            wallet_quantities=wallet_quantities,
+            expected_price_wei=10000000000000000,
+        )
+
+        # Verify neither was cancelled, and both succeeded with their distinct quantities!
+        assert len(results) == 2
+        r1 = next(r for r in results if r.wallet.address == w1.address)
+        r2 = next(r for r in results if r.wallet.address == w2.address)
+
+        assert r1.status == "SUCCESS"
+        assert r1.quantity == 3
+        assert r2.status == "SUCCESS"
+        assert r2.quantity == 1
+
+    asyncio.run(run_test())
+
+
+def test_allocation_decrement_fallback():
+    import asyncio
+    from unittest.mock import AsyncMock
+    from minter.client import OpenSeaClient, CollectionInfo, DropStage
+    from minter.wallet import WalletAccount
+
+    async def run_test():
+        os_client = OpenSeaClient()
+        w = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001")
+        stage = DropStage(
+            uuid="s1", label="Allowlist", stage_type="SIGNED_PRESALE", stage_index=0,
+            start_time="", end_time="", start_timestamp=0, end_timestamp=2147483647,
+            max_per_wallet=3, price_wei=0, price_symbol="ETH", price_unit=0.0
+        )
+        coll = CollectionInfo(
+            name="Coll", slug="coll", contract_address="0x1111111111111111111111111111111111111111",
+            image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=100, max_supply=100,
+            stages=[stage]
+        )
+
+        # Mock GraphQL: when quantity is 3 or 2, return MintQuantityMoreThanAllocatedForMinterError.
+        # When quantity is 1, return success!
+        attempts_seen = []
+        async def mock_post(url, json=None, headers=None):
+            resp = AsyncMock()
+            resp.status_code = 200
+            q_requested = int(json["variables"]["toAssets"][0]["quantity"])
+            attempts_seen.append(q_requested)
+            if q_requested > 1:
+                resp.json = lambda: {
+                    "data": {
+                        "swap": {
+                            "actions": [],
+                            "errors": [{"__typename": "MintQuantityMoreThanAllocatedForMinterError"}]
+                        }
+                    }
+                }
+            else:
+                resp.json = lambda: {
+                    "data": {
+                        "swap": {
+                            "actions": [{
+                                "transactionSubmissionData": {
+                                    "to": "0x00005EA00Ac477B1030CE78506496e8C2dE24bf5",
+                                    "value": 0,
+                                    "data": "0x123456"
+                                }
+                            }],
+                            "errors": []
+                        }
+                    }
+                }
+            return resp
+
+        mock_http = AsyncMock()
+        mock_http.post = mock_post
+        os_client.get_wallet_client = AsyncMock(return_value=mock_http)
+
+        # Call with quantity 3
+        act = await os_client.get_mint_action_hot(coll, w, quantity=3, stage=stage, max_attempts=5)
+        
+        # Verify it decremented 3 -> 2 -> 1 and succeeded at 1!
+        assert act.quantity == 1
+        assert attempts_seen == [3, 2, 1]
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -726,6 +891,8 @@ if __name__ == "__main__":
     test_ethereum_chain_support()
     test_hedged_broadcast_dual_rpc()
     test_check_wallet_eligibility_all_stages()
+    test_differing_quantities_no_cancellation()
+    test_allocation_decrement_fallback()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

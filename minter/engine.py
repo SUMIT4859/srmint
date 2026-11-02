@@ -72,11 +72,22 @@ class MintEngine:
         stage: DropStage,
         wallets: list[WalletAccount],
         quantity_per_wallet: int = 1,
+        wallet_quantities: dict[str, int] | None = None,
         expected_price_wei: int | None = None,
         on_progress: Callable[[str], asyncio.Future[Any] | Any] | None = None,
     ) -> list[WalletMintResult]:
         self._cancel_requested = False
-        results = [WalletMintResult(wallet=w, quantity=quantity_per_wallet) for w in wallets]
+        if wallet_quantities is None:
+            wallet_quantities = {w.address: quantity_per_wallet for w in wallets}
+        else:
+            for w in wallets:
+                if w.address not in wallet_quantities:
+                    wallet_quantities[w.address] = quantity_per_wallet
+
+        results = [
+            WalletMintResult(wallet=w, quantity=wallet_quantities.get(w.address, quantity_per_wallet))
+            for w in wallets
+        ]
 
         async def notify(msg: str) -> None:
             if on_progress:
@@ -148,11 +159,12 @@ class MintEngine:
             except Exception:
                 max_fee = int(self.config.max_priority_fee_gwei * 1e9) + 500_000_000
 
-            mint_cost = stage.price_wei * quantity_per_wallet
             estimated_gas_cost = min(self.config.gas_limit * max_fee, int(0.0005 * 1e18))
-            total_required = mint_cost + estimated_gas_cost
 
             for res in results:
+                w_qty = wallet_quantities.get(res.wallet.address, quantity_per_wallet)
+                mint_cost = stage.price_wei * w_qty
+                total_required = mint_cost + estimated_gas_cost
                 bal = balances.get(res.wallet.address, 0)
                 # For free mints, only notify if the wallet has strictly 0 balance (cannot pay any gas)
                 if mint_cost == 0:
@@ -166,7 +178,7 @@ class MintEngine:
                     cost_eth = total_required / 1e18
                     await notify(
                         f"⚠️ Notice: {res.wallet.short_address} balance is {bal_eth:.5f} ETH "
-                        f"(mint total ~{cost_eth:.5f} ETH)."
+                        f"(mint total ~{cost_eth:.5f} ETH for {w_qty} NFT(s))."
                     )
 
             # 3. Scheduled countdown wait with live updates
@@ -219,14 +231,15 @@ class MintEngine:
                 # Direct on-chain SeaDrop mintPublic with chain-specific fee recipient: zero API delay, instant 100% pre-signed!
                 fee_recipient = get_fee_recipient(chain_id)
                 for w in wallets:
+                    w_qty = wallet_quantities.get(w.address, quantity_per_wallet)
                     cdata = encode_public_mint(
                         nft_contract=collection.contract_address,
                         minter_recipient=w.address,
-                        quantity=quantity_per_wallet,
+                        quantity=w_qty,
                         fee_recipient=fee_recipient,
                     )
                     nonce = nonces[w.address]
-                    val = stage.price_wei * quantity_per_wallet
+                    val = stage.price_wei * w_qty
                     tx_dict = {
                         "type": 2,
                         "chainId": chain_id,
@@ -242,21 +255,23 @@ class MintEngine:
                     prepared_tx_map[w.address] = raw_bytes
                     for r in results:
                         if r.wallet.address == w.address:
+                            r.quantity = w_qty
                             r.tx_hash = tx_hash
                             r.explorer_url = get_tx_explorer_url(chain_id, tx_hash)
 
             else:
                 # Private/Allowlist: zero-spam single-attempt pre-fetch
                 await notify("📡 T-10s: Checking for advance allowlist calldata (single attempt)...")
-                prefetch_sem = asyncio.Semaphore(3)
+                prefetch_sem = asyncio.Semaphore(15)
 
                 async def prefetch_check(idx: int, w: WalletAccount):
-                    await asyncio.sleep(idx * 0.025)
+                    w_qty = wallet_quantities.get(w.address, quantity_per_wallet)
+                    await asyncio.sleep(idx * 0.005)
                     async with prefetch_sem:
                         return await self.opensea.get_mint_action_hot(
                             collection,
                             w,
-                            quantity_per_wallet,
+                            w_qty,
                             stage,
                             max_attempts=1,
                             single_attempt=True,
@@ -269,14 +284,18 @@ class MintEngine:
                 for w, act_res in zip(wallets, prefetch_results):
                     r = next(res for res in results if res.wallet.address == w.address)
                     if isinstance(act_res, MintAction):
-                        # Safety Net: Price Guard checks
+                        actual_q = act_res.quantity
+                        r.quantity = actual_q
+                        wallet_quantities[w.address] = actual_q
+
+                        # Safety Net: Price Guard checks per-wallet!
                         if expected_price_wei == 0 and act_res.value > 0:
                             r.status = "CANCELLED_PAID_ON_FREE"
                             r.error_message = f"Calldata required {act_res.value / 1e18:.6f} ETH on Free stage"
                             continue
-                        if expected_price_wei is not None and act_res.value > (expected_price_wei * quantity_per_wallet):
+                        if expected_price_wei is not None and act_res.value > (expected_price_wei * actual_q):
                             r.status = "CANCELLED_PRICE_EXCEEDED"
-                            r.error_message = f"Calldata value ({act_res.value}) exceeded expected ({expected_price_wei * quantity_per_wallet})"
+                            r.error_message = f"Calldata value ({act_res.value}) exceeded expected ({expected_price_wei * actual_q})"
                             continue
 
                         nonce = nonces[w.address]
@@ -315,18 +334,22 @@ class MintEngine:
                     await notify(f"🚨 <b>PRICE GUARD ABORT:</b> {first_canc.error_message}")
                     return results
 
-                # Price Uniformity Guard on pre-fetched actions
+                # Price Uniformity Guard on pre-fetched actions (Checks per-unit price so differing quantities don't trigger false cancel!)
                 if len(prefetched_actions) > 1:
-                    distinct_vals = {act.value for act in prefetched_actions.values()}
-                    if len(distinct_vals) > 1:
+                    distinct_unit_prices = set()
+                    for w_addr, act in prefetched_actions.items():
+                        w_q = wallet_quantities.get(w_addr, 1)
+                        distinct_unit_prices.add(act.value // max(1, w_q))
+
+                    if len(distinct_unit_prices) > 1:
                         alert_msg = (
-                            "🚨 <b>PRICE GUARD: MISMATCHED PRICES IN CALLEDATA!</b>\n"
-                            "Differing prices returned across wallets in pre-fetched allowlist calldata. Mint aborted!"
+                            "🚨 <b>PRICE GUARD: MISMATCHED UNIT PRICES IN CALLEDATA!</b>\n"
+                            "Differing unit prices returned across wallets in pre-fetched allowlist calldata. Mint aborted!"
                         )
                         await notify(alert_msg)
                         for r in results:
                             r.status = "CANCELLED_PRICE_MISMATCH"
-                            r.error_message = "Differing prices returned across wallets in allowlist calldata"
+                            r.error_message = "Differing unit prices returned across wallets in allowlist calldata"
                         return results
 
                 ready_count = len(prepared_tx_map)
@@ -337,20 +360,34 @@ class MintEngine:
                 else:
                     await notify(f"⏳ Calldata will unlock at T-0. Pipelined workers ready for {len(wallets_needing_t0)} wallet(s).")
 
-            # 5. High-Precision Countdown to T-0 with RPC Pre-Warmup & Lead Offset Compensation
+            # 5. High-Precision Countdown to T-0 with RPC & GraphQL Pre-Warmup & Lead Offset Compensation
             if target_start_ts > time.time():
                 lead_seconds = self.config.broadcast_lead_ms / 1000.0
                 target_broadcast_time = target_start_ts - lead_seconds
 
                 rem = target_broadcast_time - time.time()
-                # If countdown is long enough, sleep until T-1.5s then pulse warm RPC sockets
-                if rem > 1.8:
-                    await asyncio.sleep(rem - 1.5)
-                    # Warmup both primary and fallback RPC connections so TCP/TLS handshakes are hot for T-0!
+                # If countdown is long enough, sleep until T-2.0s then pulse warm RPC sockets and OpenSea GraphQL session
+                if rem > 2.5:
+                    await asyncio.sleep(rem - 2.0)
+                    # Warmup both primary and fallback RPC connections and OpenSea GraphQL sockets so TCP/TLS handshakes are hot!
                     try:
                         tasks = [active_chain.rpc_request("eth_blockNumber", [])]
                         if active_chain.fallback_rpc_url and active_chain.fallback_rpc_url != active_chain.rpc_url:
                             tasks.append(active_chain.rpc_request("eth_blockNumber", [], use_fallback=True))
+                        # Warm OpenSea GraphQL client socket
+                        os_cl = await self.opensea.get_client()
+                        tasks.append(os_cl.post(
+                            GRAPHQL_URL,
+                            json={"query": "query KeepWarm { __typename }", "variables": {}},
+                            headers={"x-app-id": APP_ID, "origin": SITE_URL},
+                        ))
+                        for w in wallets:
+                            w_cl = await self.opensea.get_wallet_client(w.address)
+                            tasks.append(w_cl.post(
+                                GRAPHQL_URL,
+                                json={"query": "query KeepWarm { __typename }", "variables": {}},
+                                headers={"x-app-id": APP_ID, "origin": SITE_URL},
+                            ))
                         await asyncio.gather(*tasks, return_exceptions=True)
                     except Exception:
                         pass
@@ -373,11 +410,12 @@ class MintEngine:
                     r.status = "FAILED"
                     r.error_message = f"Broadcast failed: {ex}"
 
-            pipeline_sem = asyncio.Semaphore(10)
+            pipeline_sem = asyncio.Semaphore(15)
 
             async def pipeline_wallet(idx: int, w: WalletAccount) -> None:
                 r = next(res for res in results if res.wallet.address == w.address)
-                await asyncio.sleep(idx * 0.015)
+                w_qty = wallet_quantities.get(w.address, quantity_per_wallet)
+                await asyncio.sleep(idx * 0.005)
 
                 t_call_start = time.time()
                 async with pipeline_sem:
@@ -385,26 +423,29 @@ class MintEngine:
                         act = await self.opensea.get_mint_action_hot(
                             collection,
                             w,
-                            quantity_per_wallet,
+                            w_qty,
                             stage,
                             max_attempts=self.config.max_retry_attempts,
-                            retry_interval_ms=50,
+                            retry_interval_ms=35,
                         )
                         r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
+                        actual_qty = act.quantity
+                        r.quantity = actual_qty
+                        wallet_quantities[w.address] = actual_qty
                     except Exception as ex:
                         r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                         r.status = "FAILED"
                         r.error_message = str(ex)
                         return
 
-                # Safety Net: Price Guard checks
+                # Safety Net: Price Guard checks per-wallet
                 if expected_price_wei == 0 and act.value > 0:
                     r.status = "CANCELLED_PAID_ON_FREE"
                     r.error_message = f"Calldata required {act.value / 1e18:.6f} ETH on Free stage"
                     return
-                if expected_price_wei is not None and act.value > (expected_price_wei * quantity_per_wallet):
+                if expected_price_wei is not None and act.value > (expected_price_wei * actual_qty):
                     r.status = "CANCELLED_PRICE_EXCEEDED"
-                    r.error_message = f"Calldata value ({act.value}) exceeded expected ({expected_price_wei * quantity_per_wallet})"
+                    r.error_message = f"Calldata value ({act.value}) exceeded expected ({expected_price_wei * actual_qty})"
                     return
 
                 # Sign locally
