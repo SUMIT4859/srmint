@@ -871,6 +871,105 @@ def test_allocation_decrement_fallback():
     asyncio.run(run_test())
 
 
+def test_siwe_statement_and_headers():
+    from minter.constants import SIWE_STATEMENT
+    from minter.client import OpenSeaClient
+    
+    # Must use OpenSea's exact required statement
+    assert "Platform Terms of Service" in SIWE_STATEMENT
+    assert "https://opensea.io/tos" in SIWE_STATEMENT
+    assert "https://opensea.io/privacy" in SIWE_STATEMENT
+
+    # Test headers generation with api_key and token
+    os_client = OpenSeaClient(api_key="test_key_123")
+    os_client._wallet_tokens["0x1111111111111111111111111111111111111111"] = "jwt_token_abc"
+
+    headers = os_client._get_headers(wallet_address="0x1111111111111111111111111111111111111111", slug="cool-drop")
+    assert headers["x-api-key"] == "test_key_123"
+    assert headers["authorization"] == "Bearer jwt_token_abc"
+    assert headers["origin"] == "https://opensea.io"
+    assert "cool-drop" in headers["referer"]
+
+
+def test_cross_wallet_eligibility_caching():
+    import asyncio
+    from unittest.mock import AsyncMock
+    from minter.client import OpenSeaClient, CollectionInfo, DropStage
+    from minter.wallet import WalletAccount
+
+    async def run_test():
+        os_client = OpenSeaClient()
+        w1 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001", label="W1")
+        w2 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000002", label="W2")
+
+        stage1 = DropStage(
+            uuid="stage-allowlist-1",
+            label="Allowlist",
+            stage_type="SIGNED_PRESALE",
+            stage_index=1,
+            start_time="now",
+            end_time="later",
+            start_timestamp=100,
+            end_timestamp=200,
+            max_per_wallet=2,
+            price_wei=0,
+            price_symbol="ETH",
+            price_unit=0.0,
+        )
+        coll = CollectionInfo(
+            name="Test Coll",
+            slug="test-slug",
+            contract_address="0x1111111111111111111111111111111111111111",
+            image_url="",
+            chain_identifier="robinhood",
+            chain_id=4663,
+            total_supply=100,
+            max_supply=100,
+            stages=[stage1],
+        )
+
+        mock_http = AsyncMock()
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        # OpenSea returns BOTH w1 and w2 in accountStageEligibility.wallets!
+        mock_resp.json = lambda: {
+            "data": {
+                "dropBySlug": {
+                    "accountStageEligibility": {
+                        "wallets": [
+                            {
+                                "address": w1.address.lower(),
+                                "stages": [{"dropStageUuid": "stage-allowlist-1", "isEligible": True, "maxTotalMintableByWallet": 2}]
+                            },
+                            {
+                                "address": w2.address.lower(),
+                                "stages": [{"dropStageUuid": "stage-allowlist-1", "isEligible": True, "maxTotalMintableByWallet": 1}]
+                            }
+                        ]
+                    },
+                    "stages": []
+                }
+            }
+        }
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        os_client.get_wallet_client = AsyncMock(return_value=mock_http)
+        os_client.authenticate_wallet = AsyncMock()
+
+        # Check W1 only
+        eligs_w1 = await os_client.check_wallet_eligibility_all_stages(coll, w1)
+        assert eligs_w1["stage-allowlist-1"].is_eligible is True
+        assert eligs_w1["stage-allowlist-1"].max_mintable == 2
+
+        # W2 must ALREADY be cached without making another network request!
+        mock_http.post.reset_mock()
+        eligs_w2 = await os_client.check_wallet_eligibility_all_stages(coll, w2)
+        assert eligs_w2["stage-allowlist-1"].is_eligible is True
+        assert eligs_w2["stage-allowlist-1"].max_mintable == 1
+        assert mock_http.post.call_count == 0  # 0 network calls!
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -893,6 +992,8 @@ if __name__ == "__main__":
     test_check_wallet_eligibility_all_stages()
     test_differing_quantities_no_cancellation()
     test_allocation_decrement_fallback()
+    test_siwe_statement_and_headers()
+    test_cross_wallet_eligibility_caching()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

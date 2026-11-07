@@ -26,7 +26,7 @@ GRAPHQL_URL = "https://gql.opensea.io/graphql"
 APP_ID = "os2-web"
 
 SIWE_STATEMENT = (
-    "Click to sign in and accept the OpenSea Terms of Service "
+    "Click to sign in and accept the Platform Terms of Service "
     "(https://opensea.io/tos) and Privacy Policy (https://opensea.io/privacy)."
 )
 

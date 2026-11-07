@@ -23,7 +23,10 @@ class TelegramBot:
         self.config = config
         self.wallets = wallet_mgr
         self.chain = ChainClient(config.rpc_url, config.fallback_rpc_url)
-        self.opensea = OpenSeaClient(timeout_seconds=config.opensea_timeout_ms / 1000.0)
+        self.opensea = OpenSeaClient(
+            timeout_seconds=config.opensea_timeout_ms / 1000.0,
+            api_key=getattr(config, "opensea_api_key", ""),
+        )
         self.engine = MintEngine(self.config, self.chain, self.opensea)
 
         self.token = config.telegram_bot_token
@@ -231,6 +234,13 @@ class TelegramBot:
                         all_stage_map = await self.opensea.check_wallet_eligibility_all_stages(coll, w)
                         for s_uuid, el in all_stage_map.items():
                             eligibility_cache[(s_uuid, w.address)] = el
+                        # Also sync any cross-populated wallets from OpenSea's response into session eligibility_cache!
+                        for (c_slug, w_addr), st_map in self.opensea._wallet_stage_elig_cache.items():
+                            if c_slug == coll.slug:
+                                for s_uuid, el in st_map.items():
+                                    for act_w in all_configured_wallets:
+                                        if act_w.address.lower() == w_addr:
+                                            eligibility_cache[(s_uuid, act_w.address)] = el
                     except Exception:
                         eligibility_cache[(stage.uuid, w.address)] = WalletEligibility(False, reason="Check Failed")
 
@@ -375,6 +385,12 @@ class TelegramBot:
                         all_m = await self.opensea.check_wallet_eligibility_all_stages(coll, w)
                         for s_u, el in all_m.items():
                             session.setdefault("eligibility_cache", {})[(s_u, w.address)] = el
+                        for (c_slug, w_addr), st_map in self.opensea._wallet_stage_elig_cache.items():
+                            if c_slug == coll.slug:
+                                for s_uuid, el in st_map.items():
+                                    for act_w in wallets:
+                                        if act_w.address.lower() == w_addr:
+                                            session.setdefault("eligibility_cache", {})[(s_uuid, act_w.address)] = el
                     except Exception:
                         pass
                 await asyncio.gather(*(fetch_missing(w) for w in uncached))

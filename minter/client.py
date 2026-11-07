@@ -248,14 +248,32 @@ async def get_eth_usd_rate() -> float:
 
 
 class OpenSeaClient:
-    def __init__(self, timeout_seconds: float = 10.0) -> None:
+    def __init__(self, timeout_seconds: float = 10.0, api_key: str = "") -> None:
         self.timeout_seconds = timeout_seconds
+        self.api_key = api_key
         self._client: httpx.AsyncClient | None = None
         self._wallet_clients: dict[str, httpx.AsyncClient] = {}  # address -> isolated httpx.AsyncClient
         self._wallet_sessions: dict[str, dict[str, str]] = {}  # address -> cookies/headers
+        self._wallet_tokens: dict[str, str] = {}  # address -> access_token
         self._heartbeat_task: asyncio.Task | None = None
         self._authenticated_wallets: set[str] = set()  # address -> authenticated
         self._wallet_stage_elig_cache: dict[tuple[str, str], dict[str, WalletEligibility]] = {}
+
+    def _get_headers(self, wallet_address: str | None = None, slug: str | None = None) -> dict[str, str]:
+        """Construct standard OpenSea API headers including auth token and API key if available."""
+        headers = {
+            "accept": "application/json",
+            "origin": SITE_URL,
+            "referer": f"{SITE_URL}/collection/{slug}" if slug else f"{SITE_URL}/",
+            "x-app-id": APP_ID,
+        }
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
+        if wallet_address:
+            token = self._wallet_tokens.get(wallet_address.lower())
+            if token:
+                headers["authorization"] = f"Bearer {token}"
+        return headers
 
     async def get_client(self) -> httpx.AsyncClient:
         """General unauthenticated client for public collection metadata."""
@@ -287,6 +305,7 @@ class OpenSeaClient:
     async def close(self) -> None:
         self.stop_heartbeat()
         self._authenticated_wallets.clear()
+        self._wallet_tokens.clear()
         self._wallet_stage_elig_cache.clear()
         if self._client and not self._client.is_closed:
             await self._client.aclose()
@@ -310,13 +329,26 @@ class OpenSeaClient:
         while True:
             try:
                 await asyncio.sleep(interval_seconds)
-                # Ping GraphQL lightly
+                # Ping GraphQL lightly on general client
                 client = await self.get_client()
-                await client.post(
-                    GRAPHQL_URL,
-                    json={"query": "query KeepAlive { __typename }", "variables": {}},
-                    headers={"x-app-id": APP_ID, "origin": SITE_URL},
-                )
+                tasks = [
+                    client.post(
+                        GRAPHQL_URL,
+                        json={"query": "query KeepAlive { __typename }", "variables": {}},
+                        headers=self._get_headers(slug=slug),
+                    )
+                ]
+                # Also pulse each wallet client to keep their HTTP/2 multiplexed streams alive!
+                for w in wallets:
+                    w_cl = await self.get_wallet_client(w.address)
+                    tasks.append(
+                        w_cl.post(
+                            GRAPHQL_URL,
+                            json={"query": "query KeepAlive { __typename }", "variables": {}},
+                            headers=self._get_headers(w.address, slug=slug),
+                        )
+                    )
+                await asyncio.gather(*tasks, return_exceptions=True)
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -528,15 +560,17 @@ class OpenSeaClient:
     async def authenticate_wallet(self, wallet: WalletAccount, chain_id: int, slug: str) -> None:
         """Authenticate wallet using SIWE on OpenSea with its isolated client."""
         addr_lower = wallet.address.lower()
-        if addr_lower in self._authenticated_wallets:
+        if addr_lower in self._authenticated_wallets and addr_lower in self._wallet_tokens:
             return
 
         client = await self.get_wallet_client(wallet.address)
-        coll_url = f"{SITE_URL}/collection/{slug}"
         headers = {
+            "accept": "application/json",
             "origin": SITE_URL,
-            "referer": coll_url,
+            "referer": f"{SITE_URL}/collection/{slug}",
         }
+        if self.api_key:
+            headers["x-api-key"] = self.api_key
 
         # 1. Fetch nonce via POST
         nonce_resp = await client.post(f"{SITE_URL}/__api/auth/siwe/nonce", headers=headers)
@@ -544,14 +578,14 @@ class OpenSeaClient:
         nonce_data = nonce_resp.json()
         nonce = nonce_data.get("nonce") if isinstance(nonce_data, dict) else str(nonce_data)
 
-        # 2. Construct SIWE message
+        # 2. Construct SIWE message strictly per OpenSea requirements
         domain = "opensea.io"
         issued_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         address = wallet.address
 
         message = (
             f"{domain} wants you to sign in with your Ethereum account:\n{address}\n\n"
-            f"{SIWE_STATEMENT}\n\nURI: {coll_url}\nVersion: 1\nChain ID: {chain_id}\n"
+            f"{SIWE_STATEMENT}\n\nURI: {SITE_URL}\nVersion: 1\nChain ID: {chain_id}\n"
             f"Nonce: {nonce}\nIssued At: {issued_at}"
         )
 
@@ -563,7 +597,7 @@ class OpenSeaClient:
                 "domain": domain,
                 "address": address,
                 "statement": SIWE_STATEMENT,
-                "uri": coll_url,
+                "uri": SITE_URL,
                 "version": "1",
                 "chainId": str(chain_id),
                 "nonce": nonce,
@@ -576,15 +610,10 @@ class OpenSeaClient:
         verify_resp = await client.post(f"{SITE_URL}/__api/auth/siwe/verify", json=verify_body, headers=headers)
         if verify_resp.status_code == 200:
             self._authenticated_wallets.add(addr_lower)
-            # Sync cookies to .opensea.io and gql.opensea.io so GraphQL session is recognized
-            for cookie in list(client.cookies.jar):
-                try:
-                    client.cookies.set(cookie.name, cookie.value, domain=".opensea.io", path="/")
-                    client.cookies.set(cookie.name, cookie.value, domain="gql.opensea.io", path="/")
-                except Exception:
-                    pass
-            client.cookies.set("connected-account-server-hint", wallet.address, domain=".opensea.io", path="/")
-            client.cookies.set("connected-account-server-hint", wallet.address, domain="gql.opensea.io", path="/")
+            for cookie in client.cookies.jar:
+                if cookie.name == "access_token":
+                    self._wallet_tokens[addr_lower] = cookie.value
+                    break
 
     async def authenticate_all_wallets(self, wallets: list[WalletAccount], chain_id: int, slug: str) -> None:
         """Authenticate multiple wallets concurrently."""
@@ -627,12 +656,7 @@ class OpenSeaClient:
             "recipient": None,
         }
 
-        headers = {
-            "accept": "application/json",
-            "origin": SITE_URL,
-            "referer": f"{SITE_URL}/collection/{collection.slug}",
-            "x-app-id": APP_ID,
-        }
+        headers = self._get_headers(wallet.address, collection.slug)
 
         last_err = None
         attempts = 1 if single_attempt else max_attempts
@@ -653,11 +677,11 @@ class OpenSeaClient:
                     retry_after_hdr = resp.headers.get("retry-after")
                     if retry_after_hdr:
                         try:
-                            delay = max(0.4, float(retry_after_hdr) + random.uniform(0.05, 0.15))
+                            delay = max(0.2, float(retry_after_hdr) + random.uniform(0.02, 0.08))
                         except ValueError:
-                            delay = 0.5 + random.uniform(0.05, 0.15)
+                            delay = 0.25 + random.uniform(0.02, 0.08)
                     else:
-                        delay = min(2.5, 0.3 * (1.5 ** attempt) + random.uniform(0.05, 0.20))
+                        delay = min(1.2, 0.15 * (1.3 ** attempt) + random.uniform(0.02, 0.08))
 
                     last_err = RuntimeError(f"OpenSea: Rate Limited (HTTP 429), backing off {delay:.2f}s")
                     if single_attempt:
@@ -669,7 +693,7 @@ class OpenSeaClient:
                     last_err = RuntimeError(f"OpenSea HTTP {resp.status_code}")
                     if single_attempt:
                         raise last_err
-                    delay = min(1.5, 0.25 * (1.3 ** attempt) + random.uniform(0.05, 0.10))
+                    delay = min(1.0, 0.15 * (1.2 ** attempt) + random.uniform(0.02, 0.06))
                     await asyncio.sleep(delay)
                     continue
 
@@ -681,7 +705,7 @@ class OpenSeaClient:
 
                     # GraphQL rate limit error
                     if "too many requests" in err_text.lower() or "rate limit" in err_text.lower() or "throttled" in err_text.lower():
-                        delay = min(2.5, 0.3 * (1.5 ** attempt) + random.uniform(0.05, 0.20))
+                        delay = min(1.2, 0.15 * (1.3 ** attempt) + random.uniform(0.02, 0.08))
                         last_err = RuntimeError(f"OpenSea: Rate Limited ({err_text}), backing off {delay:.2f}s")
                         if single_attempt:
                             raise last_err
@@ -713,15 +737,22 @@ class OpenSeaClient:
                     swap_errors = swap.get("errors", [])
                     if swap_errors:
                         err_names = [e.get("__typename", "") for e in swap_errors if isinstance(e, dict)]
-                        if "MinterNotEligibleForActiveDropStageError" in err_names:
+                        is_not_started = (
+                            "MinterNotEligibleForActiveDropStageError" in err_names
+                            or "DropStageNotStartedError" in err_names
+                            or "DropStageInactiveError" in err_names
+                            or "DropNotStartedError" in err_names
+                            or "StageNotActiveError" in err_names
+                        )
+                        if is_not_started:
                             if single_attempt:
                                 raise RuntimeError("Waiting for OpenSea stage activation...")
                             now_ts = time.time()
                             # If target stage has not started yet or within transition window, wait for activation
                             if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
                                 last_err = RuntimeError("Waiting for OpenSea stage activation...")
-                                # Rapid 35ms poll during activation window to grab calldata immediately when live!
-                                await asyncio.sleep(0.035)
+                                # Rapid 25ms poll during activation window to grab calldata immediately when live!
+                                await asyncio.sleep(0.025)
                                 continue
                             else:
                                 raise RuntimeError("Wallet is not on the Allowlist for this stage")
@@ -748,10 +779,9 @@ class OpenSeaClient:
                     if "not on the allowlist" in err_str or "not eligible" in err_str:
                         raise e
 
-            # Adaptive retry sleep with jitter
+            # Adaptive retry sleep
             if attempt < attempts:
-                jitter = random.uniform(0.02, 0.06)
-                await asyncio.sleep((retry_interval_ms / 1000.0) + jitter)
+                await asyncio.sleep(retry_interval_ms / 1000.0)
 
         raise RuntimeError(f"OpenSea mint calldata unavailable: {last_err}")
 
@@ -789,12 +819,7 @@ class OpenSeaClient:
             pass
 
         client = await self.get_wallet_client(wallet.address)
-        headers = {
-            "accept": "application/json",
-            "origin": SITE_URL,
-            "referer": f"{SITE_URL}/collection/{collection.slug}",
-            "x-app-id": APP_ID,
-        }
+        headers = self._get_headers(wallet.address, collection.slug)
 
         # Query DropEligibilityQuery
         try:
@@ -827,65 +852,94 @@ class OpenSeaClient:
                         wei = int(round(unit * 1e18))
                         top_stage_prices[u] = (unit, sym, wei)
 
+                # Process and cross-populate cache for ALL wallets returned by OpenSea in this query!
                 for w_info in wallets_list:
-                    if w_info.get("address", "").lower() == wallet.address.lower():
-                        qty_minted = int(w_info.get("quantityMinted") or 0)
-                        for st_info in w_info.get("stages", []):
-                            u = st_info.get("dropStageUuid", "")
-                            matching_stage = next((s for s in collection.stages if s.uuid == u), None)
-                            fb_unit = matching_stage.price_unit if matching_stage else 0.0
-                            fb_sym = matching_stage.price_symbol if matching_stage else "ETH"
-                            fb_wei = matching_stage.price_wei if matching_stage else 0
-                            if u in top_stage_prices:
-                                fb_unit, fb_sym, fb_wei = top_stage_prices[u]
+                    w_addr_lower = w_info.get("address", "").lower()
+                    w_qty_minted = int(w_info.get("quantityMinted") or 0)
+                    w_stage_results: dict[str, WalletEligibility] = {}
 
-                            # Determine max mintable
-                            max_total = st_info.get("maxTotalMintableByWallet")
-                            if max_total is None:
-                                top_st = next((s for s in stages_list if s.get("uuid") == u), None)
-                                if top_st:
-                                    max_total = top_st.get("eligibleMaxTotalMintableByWallet") or top_st.get("maxTotalMintableByWallet")
-                            if max_total is None and matching_stage:
-                                max_total = matching_stage.max_per_wallet
-                            max_total_int = int(max_total or 1)
-                            remaining_mintable = max(0, max_total_int - qty_minted)
+                    for st in collection.stages:
+                        if st.is_public:
+                            w_stage_results[st.uuid] = WalletEligibility(
+                                is_eligible=True,
+                                price_wei=st.price_wei,
+                                price_unit=st.price_unit,
+                                price_symbol=st.price_symbol,
+                                reason="Eligible (Public Sale)",
+                                max_mintable=st.max_per_wallet or 1,
+                            )
 
-                            if st_info.get("isEligible") is True:
-                                if remaining_mintable == 0:
-                                    results[u] = WalletEligibility(
-                                        is_eligible=False,
-                                        price_wei=0,
-                                        price_unit=0.0,
-                                        price_symbol="ETH",
-                                        reason="Already minted maximum allocation",
-                                        max_mintable=0,
-                                    )
-                                    continue
+                    for st_info in w_info.get("stages", []):
+                        u = st_info.get("dropStageUuid", "")
+                        matching_stage = next((s for s in collection.stages if s.uuid == u), None)
+                        fb_unit = matching_stage.price_unit if matching_stage else 0.0
+                        fb_sym = matching_stage.price_symbol if matching_stage else "ETH"
+                        fb_wei = matching_stage.price_wei if matching_stage else 0
+                        if u in top_stage_prices:
+                            fb_unit, fb_sym, fb_wei = top_stage_prices[u]
 
-                                p_tok = (st_info.get("price") or {}).get("token") or {}
-                                if p_tok.get("unit") is not None:
-                                    p_unit = float(p_tok.get("unit") or 0.0)
-                                    p_sym = p_tok.get("symbol") or "ETH"
-                                    p_wei = int(round(p_unit * 1e18))
-                                else:
-                                    p_unit, p_sym, p_wei = fb_unit, fb_sym, fb_wei
-                                results[u] = WalletEligibility(
-                                    is_eligible=True,
-                                    price_wei=p_wei,
-                                    price_unit=p_unit,
-                                    price_symbol=p_sym,
-                                    reason="Eligible (Allowlist Verified)",
-                                    max_mintable=max(1, remaining_mintable),
-                                )
-                            elif st_info.get("isEligible") is False:
-                                results[u] = WalletEligibility(
+                        max_total = st_info.get("maxTotalMintableByWallet")
+                        if max_total is None:
+                            top_st = next((s for s in stages_list if s.get("uuid") == u), None)
+                            if top_st:
+                                max_total = top_st.get("eligibleMaxTotalMintableByWallet") or top_st.get("maxTotalMintableByWallet")
+                        if max_total is None and matching_stage:
+                            max_total = matching_stage.max_per_wallet
+                        max_total_int = int(max_total or 1)
+                        remaining_mintable = max(0, max_total_int - w_qty_minted)
+
+                        if st_info.get("isEligible") is True:
+                            if remaining_mintable == 0:
+                                w_stage_results[u] = WalletEligibility(
                                     is_eligible=False,
                                     price_wei=0,
                                     price_unit=0.0,
                                     price_symbol="ETH",
-                                    reason="Not on Allowlist",
+                                    reason="Already minted maximum allocation",
                                     max_mintable=0,
                                 )
+                                continue
+
+                            p_tok = (st_info.get("price") or {}).get("token") or {}
+                            if p_tok.get("unit") is not None:
+                                p_unit = float(p_tok.get("unit") or 0.0)
+                                p_sym = p_tok.get("symbol") or "ETH"
+                                p_wei = int(round(p_unit * 1e18))
+                            else:
+                                p_unit, p_sym, p_wei = fb_unit, fb_sym, fb_wei
+                            w_stage_results[u] = WalletEligibility(
+                                is_eligible=True,
+                                price_wei=p_wei,
+                                price_unit=p_unit,
+                                price_symbol=p_sym,
+                                reason="Eligible (Allowlist Verified)",
+                                max_mintable=max(1, remaining_mintable),
+                            )
+                        elif st_info.get("isEligible") is False:
+                            w_stage_results[u] = WalletEligibility(
+                                is_eligible=False,
+                                price_wei=0,
+                                price_unit=0.0,
+                                price_symbol="ETH",
+                                reason="Not on Allowlist",
+                                max_mintable=0,
+                            )
+
+                    for st in collection.stages:
+                        if st.uuid not in w_stage_results:
+                            w_stage_results[st.uuid] = WalletEligibility(
+                                is_eligible=False,
+                                price_wei=0,
+                                price_unit=0.0,
+                                price_symbol="ETH",
+                                reason="Not on Allowlist",
+                            )
+
+                    if w_addr_lower:
+                        self._wallet_stage_elig_cache[(collection.slug, w_addr_lower)] = w_stage_results
+
+                if cache_key in self._wallet_stage_elig_cache:
+                    results = self._wallet_stage_elig_cache[cache_key]
 
                 # Fallback to top-level stages array if any stage was not in wallets_list
                 for st in stages_list:
@@ -897,7 +951,7 @@ class OpenSeaClient:
                         fb_sym = matching_stage.price_symbol if matching_stage else "ETH"
                         fb_wei = matching_stage.price_wei if matching_stage else 0
 
-                        if el_minter and el_minter == wallet.address.lower() and st.get("isEligible") is True:
+                        if (not el_minter or el_minter == wallet.address.lower()) and st.get("isEligible") is True:
                             el_p = (st.get("eligiblePrice") or {}).get("token") or {}
                             if el_p.get("unit") is not None:
                                 p_unit = float(el_p.get("unit") or 0.0)

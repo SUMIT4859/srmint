@@ -31,6 +31,7 @@ class AppConfig:
     max_retry_attempts: int = 30
     retry_interval_ms: int = 250
     session_heartbeat_interval_seconds: int = 25
+    opensea_api_key: str = ""
 
     def get_rpc_for_chain(self, chain_id: int) -> tuple[str, str]:
         """Return (primary_rpc, fallback_rpc) for the specified chain ID."""
@@ -88,6 +89,11 @@ class AppConfig:
         if os.getenv("WALLETS_FILE"):
             cfg.wallets_file = os.getenv("WALLETS_FILE")
 
+        if os.getenv("OPENSEA_API_KEY"):
+            cfg.opensea_api_key = os.getenv("OPENSEA_API_KEY")
+        elif os.getenv("opensea_api_key"):
+            cfg.opensea_api_key = os.getenv("opensea_api_key")
+
         return cfg
 
     def save(self, config_path: str = "config.json") -> None:
@@ -110,6 +116,7 @@ class AppConfig:
             "max_retry_attempts": self.max_retry_attempts,
             "retry_interval_ms": self.retry_interval_ms,
             "session_heartbeat_interval_seconds": self.session_heartbeat_interval_seconds,
+            "opensea_api_key": self.opensea_api_key,
         }
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
