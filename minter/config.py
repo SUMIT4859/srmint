@@ -21,6 +21,8 @@ class AppConfig:
     ink_fallback_rpc_url: str = "https://rpc-qnd.inkonchain.com"
     eth_rpc_url: str = "https://ethereum-rpc.publicnode.com"
     eth_fallback_rpc_url: str = "https://1rpc.io/eth"
+    soneium_rpc_url: str = "https://rpc.soneium.org"
+    soneium_fallback_rpc_url: str = "https://rpc.nodeflare.app/soneium/public"
     gas_limit: int = 250000
     fee_multiplier: float = 1.25
     scheduled_fee_multiplier: float = 2.0
@@ -35,6 +37,8 @@ class AppConfig:
 
     def get_rpc_for_chain(self, chain_id: int) -> tuple[str, str]:
         """Return (primary_rpc, fallback_rpc) for the specified chain ID."""
+        if chain_id == 1868:
+            return (self.soneium_rpc_url, self.soneium_fallback_rpc_url)
         if chain_id == 1:
             return (self.eth_rpc_url, self.eth_fallback_rpc_url)
         if chain_id == 57073:
@@ -73,6 +77,8 @@ class AppConfig:
         cfg.ink_fallback_rpc_url = os.getenv("INK_FALLBACK_RPC_URL", cfg.ink_fallback_rpc_url)
         cfg.eth_rpc_url = os.getenv("ETH_RPC_URL", cfg.eth_rpc_url)
         cfg.eth_fallback_rpc_url = os.getenv("ETH_FALLBACK_RPC_URL", cfg.eth_fallback_rpc_url)
+        cfg.soneium_rpc_url = os.getenv("SONEIUM_RPC_URL", cfg.soneium_rpc_url)
+        cfg.soneium_fallback_rpc_url = os.getenv("SONEIUM_FALLBACK_RPC_URL", cfg.soneium_fallback_rpc_url)
 
         if os.getenv("GAS_LIMIT"):
             try:
@@ -106,6 +112,8 @@ class AppConfig:
             "ink_fallback_rpc_url": self.ink_fallback_rpc_url,
             "eth_rpc_url": self.eth_rpc_url,
             "eth_fallback_rpc_url": self.eth_fallback_rpc_url,
+            "soneium_rpc_url": self.soneium_rpc_url,
+            "soneium_fallback_rpc_url": self.soneium_fallback_rpc_url,
             "gas_limit": self.gas_limit,
             "fee_multiplier": self.fee_multiplier,
             "scheduled_fee_multiplier": self.scheduled_fee_multiplier,

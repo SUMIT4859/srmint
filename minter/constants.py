@@ -98,6 +98,14 @@ CHAINS = {
         "fallback_rpc": "https://rpc-qnd.inkonchain.com",
         "fee_recipient": INK_FEE_RECIPIENT,
     },
+    1868: {
+        "name": "Soneium",
+        "symbol": "ETH",
+        "explorer": "https://soneium.blockscout.com",
+        "default_rpc": "https://rpc.soneium.org",
+        "fallback_rpc": "https://rpc.nodeflare.app/soneium/public",
+        "fee_recipient": OPENSEA_FEE_RECIPIENT,
+    },
 }
 
 def get_chain_info(chain_id: int) -> dict:

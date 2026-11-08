@@ -579,6 +579,45 @@ def test_ethereum_chain_support():
     assert ink_rpc == cfg.ink_rpc_url
 
 
+def test_soneium_chain_support():
+    from minter.constants import get_chain_info, get_tx_explorer_url, get_fee_recipient, OPENSEA_FEE_RECIPIENT
+    from minter.config import AppConfig
+
+    # 1. Chain constants
+    info = get_chain_info(1868)
+    assert info["name"] == "Soneium"
+    assert info["symbol"] == "ETH"
+    assert info["explorer"] == "https://soneium.blockscout.com"
+    assert info["default_rpc"] == "https://rpc.soneium.org"
+    assert info["fallback_rpc"] == "https://rpc.nodeflare.app/soneium/public"
+
+    # 2. Explorer URL
+    url = get_tx_explorer_url(1868, "0x1234567890abcdef")
+    assert url == "https://soneium.blockscout.com/tx/0x1234567890abcdef"
+
+    # 3. SeaDrop Fee Recipient (must match OpenSea Fee Recipient on Soneium to prevent FeeRecipientNotAllowed)
+    fee_recipient = get_fee_recipient(1868)
+    assert fee_recipient == OPENSEA_FEE_RECIPIENT
+    assert fee_recipient.lower() == "0x0000a26b00c1f0df003000390027140000faa719"
+
+    # 4. Config multi-chain routing
+    cfg = AppConfig()
+    cfg.soneium_rpc_url = "https://custom-soneium-rpc.com"
+    cfg.soneium_fallback_rpc_url = "https://custom-soneium-fallback.com"
+
+    son_rpc, son_fb = cfg.get_rpc_for_chain(1868)
+    assert son_rpc == "https://custom-soneium-rpc.com"
+    assert son_fb == "https://custom-soneium-fallback.com"
+
+    # 5. Robinhood, Ink, and Ethereum routing remain 100% intact
+    rb_rpc, _ = cfg.get_rpc_for_chain(4663)
+    ink_rpc, _ = cfg.get_rpc_for_chain(57073)
+    eth_rpc, _ = cfg.get_rpc_for_chain(1)
+    assert rb_rpc == cfg.rpc_url
+    assert ink_rpc == cfg.ink_rpc_url
+    assert eth_rpc == cfg.eth_rpc_url
+
+
 def test_hedged_broadcast_dual_rpc():
     import asyncio
     from unittest.mock import AsyncMock, patch
@@ -988,6 +1027,7 @@ if __name__ == "__main__":
     test_pipelined_mint_engine_execution()
     test_ink_chain_support()
     test_ethereum_chain_support()
+    test_soneium_chain_support()
     test_hedged_broadcast_dual_rpc()
     test_check_wallet_eligibility_all_stages()
     test_differing_quantities_no_cancellation()
