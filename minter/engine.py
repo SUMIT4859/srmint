@@ -461,6 +461,8 @@ class MintEngine:
                     await asyncio.sleep(rem_warm2 - 0.7)
                     try:
                         tasks = [active_chain.rpc_request("eth_blockNumber", [])]
+                        if active_chain.fallback_rpc_url and active_chain.fallback_rpc_url != active_chain.rpc_url:
+                            tasks.append(active_chain.rpc_request("eth_blockNumber", [], use_fallback=True))
                         for w in wallets:
                             w_cl = await self.opensea.get_wallet_client(w.address)
                             tasks.append(w_cl.post(
@@ -507,26 +509,13 @@ class MintEngine:
                     r.error_message = f"Broadcast failed: {ex}"
 
             pipeline_sem = asyncio.Semaphore(15)
-            stage_active_event = asyncio.Event()
-            # If already live or not a scheduled mint, release followers immediately
-            if not is_scheduled or target_start_ts <= time.time():
-                stage_active_event.set()
 
             async def pipeline_wallet(idx: int, w: WalletAccount) -> None:
                 r = next(res for res in results if res.wallet.address == w.address)
                 w_qty = wallet_quantities.get(w.address, quantity_per_wallet)
 
-                # Coordinated Stage Activation:
-                # Wallet 0 is the probe leader that polls OpenSea until the stage activates.
-                # Wallets 1..N wait for the leader to signal that the stage is active,
-                # ensuring OpenSea rate limits are never exceeded and all follower wallets
-                # get calldata on Attempt 1 in ~200ms!
-                if idx > 0 and not stage_active_event.is_set():
-                    try:
-                        await asyncio.wait_for(stage_active_event.wait(), timeout=2.0)
-                    except asyncio.TimeoutError:
-                        stage_active_event.set()
-                else:
+                # Micro-stagger (2ms) across wallets to distribute initial socket bursts cleanly
+                if idx > 0:
                     await asyncio.sleep(idx * 0.002)
 
                 t_call_start = time.time()
@@ -540,17 +529,11 @@ class MintEngine:
                             max_attempts=self.config.max_retry_attempts,
                             retry_interval_ms=25,
                         )
-                        # The instant ANY wallet gets calldata, the stage is active! Signal all followers!
-                        if not stage_active_event.is_set():
-                            stage_active_event.set()
-
                         r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                         actual_qty = act.quantity
                         r.quantity = actual_qty
                         wallet_quantities[w.address] = actual_qty
                     except Exception as ex:
-                        if not stage_active_event.is_set():
-                            stage_active_event.set()
                         r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                         r.status = "FAILED"
                         r.error_message = str(ex)
