@@ -106,6 +106,22 @@ CHAINS = {
         "fallback_rpc": "https://rpc.nodeflare.app/soneium/public",
         "fee_recipient": OPENSEA_FEE_RECIPIENT,
     },
+    99901: {
+        "name": "Elysium",
+        "symbol": "HYPE",
+        "explorer": "https://elyscan.fun",
+        "default_rpc": "https://rpc.elysium.kinetiq.xyz",
+        "fallback_rpc": "https://rpc-live.elysp.com",
+        "fee_recipient": OPENSEA_FEE_RECIPIENT,
+    },
+    1339: {
+        "name": "Elysium (Vulcan Forged)",
+        "symbol": "LAVA",
+        "explorer": "https://explorer.elysiumchain.tech",
+        "default_rpc": "https://rpc.elysiumchain.tech",
+        "fallback_rpc": "https://rpc.elysiumchain.us",
+        "fee_recipient": OPENSEA_FEE_RECIPIENT,
+    },
 }
 
 def get_chain_info(chain_id: int) -> dict:

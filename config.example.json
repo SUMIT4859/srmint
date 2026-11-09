@@ -9,6 +9,8 @@
   "eth_fallback_rpc_url": "https://1rpc.io/eth",
   "soneium_rpc_url": "https://rpc.soneium.org",
   "soneium_fallback_rpc_url": "https://rpc.nodeflare.app/soneium/public",
+  "elysium_rpc_url": "https://rpc.elysium.kinetiq.xyz",
+  "elysium_fallback_rpc_url": "https://rpc-live.elysp.com",
   "gas_limit": 300000,
   "fee_multiplier": 1.25,
   "scheduled_fee_multiplier": 2.0,

@@ -377,7 +377,7 @@ class OpenSeaClient:
             "referer": SITE_URL,
             "x-app-id": APP_ID,
         }
-        chains_to_try = ["ROBINHOOD", "INK", "SONEIUM", "BASE", "ARBITRUM", "ETHEREUM", "POLYGON", "OPTIMISM", "ZORA"]
+        chains_to_try = ["ROBINHOOD", "INK", "SONEIUM", "ELYSIUM", "BASE", "ARBITRUM", "ETHEREUM", "POLYGON", "OPTIMISM", "ZORA"]
         checksummed = to_checksum_address(contract_address)
 
         for chain in chains_to_try:
@@ -441,7 +441,7 @@ class OpenSeaClient:
             end_timestamp=end_time or 2147483647,
             max_per_wallet=max_per_wallet or 1,
             price_wei=mint_price_wei,
-            price_symbol="ETH",
+            price_symbol="HYPE" if chain_id == 99901 else "ETH",
             price_unit=mint_price_wei / 1e18,
         )
 
@@ -450,7 +450,7 @@ class OpenSeaClient:
             slug=contract_address.lower(),
             contract_address=checksummed,
             image_url="",
-            chain_identifier="robinhood" if chain_id == 4663 else ("ink" if chain_id == 57073 else ("soneium" if chain_id == 1868 else ("ethereum" if chain_id == 1 else "evm"))),
+            chain_identifier="robinhood" if chain_id == 4663 else ("ink" if chain_id == 57073 else ("soneium" if chain_id == 1868 else ("elysium" if chain_id == 99901 else ("ethereum" if chain_id == 1 else "evm")))),
             chain_id=chain_id,
             total_supply=0,
             max_supply=0,

@@ -23,6 +23,8 @@ class AppConfig:
     eth_fallback_rpc_url: str = "https://1rpc.io/eth"
     soneium_rpc_url: str = "https://rpc.soneium.org"
     soneium_fallback_rpc_url: str = "https://rpc.nodeflare.app/soneium/public"
+    elysium_rpc_url: str = "https://rpc.elysium.kinetiq.xyz"
+    elysium_fallback_rpc_url: str = "https://rpc-live.elysp.com"
     gas_limit: int = 250000
     fee_multiplier: float = 1.25
     scheduled_fee_multiplier: float = 2.0
@@ -37,6 +39,8 @@ class AppConfig:
 
     def get_rpc_for_chain(self, chain_id: int) -> tuple[str, str]:
         """Return (primary_rpc, fallback_rpc) for the specified chain ID."""
+        if chain_id == 99901:
+            return (self.elysium_rpc_url, self.elysium_fallback_rpc_url)
         if chain_id == 1868:
             return (self.soneium_rpc_url, self.soneium_fallback_rpc_url)
         if chain_id == 1:
@@ -79,6 +83,8 @@ class AppConfig:
         cfg.eth_fallback_rpc_url = os.getenv("ETH_FALLBACK_RPC_URL", cfg.eth_fallback_rpc_url)
         cfg.soneium_rpc_url = os.getenv("SONEIUM_RPC_URL", cfg.soneium_rpc_url)
         cfg.soneium_fallback_rpc_url = os.getenv("SONEIUM_FALLBACK_RPC_URL", cfg.soneium_fallback_rpc_url)
+        cfg.elysium_rpc_url = os.getenv("ELYSIUM_RPC_URL", cfg.elysium_rpc_url)
+        cfg.elysium_fallback_rpc_url = os.getenv("ELYSIUM_FALLBACK_RPC_URL", cfg.elysium_fallback_rpc_url)
 
         if os.getenv("GAS_LIMIT"):
             try:
@@ -114,6 +120,8 @@ class AppConfig:
             "eth_fallback_rpc_url": self.eth_fallback_rpc_url,
             "soneium_rpc_url": self.soneium_rpc_url,
             "soneium_fallback_rpc_url": self.soneium_fallback_rpc_url,
+            "elysium_rpc_url": self.elysium_rpc_url,
+            "elysium_fallback_rpc_url": self.elysium_fallback_rpc_url,
             "gas_limit": self.gas_limit,
             "fee_multiplier": self.fee_multiplier,
             "scheduled_fee_multiplier": self.scheduled_fee_multiplier,

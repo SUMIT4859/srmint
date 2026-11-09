@@ -1,6 +1,6 @@
 # 🌊 OpenSea SeaDrop Multi-Wallet High-Speed Telegram Mint Bot
 
-An ultra-fast, concurrent multi-wallet minting bot for **OpenSea SeaDrop (ERC-721)** collections, supporting **Robinhood (4663)**, **Ink (57073)**, **Ethereum Mainnet (1)**, and **Soneium (1868)**, controlled entirely from your private **Telegram Bot** and optimized for **Android phones via Termux**, **Ubuntu (PRoot / VPS)**, Linux, and Windows.
+An ultra-fast, concurrent multi-wallet minting bot for **OpenSea SeaDrop (ERC-721)** collections, supporting **Robinhood (4663)**, **Ink (57073)**, **Ethereum Mainnet (1)**, **Soneium (1868)**, and **Elysium (99901)**, controlled entirely from your private **Telegram Bot** and optimized for **Android phones via Termux**, **Ubuntu (PRoot / VPS)**, Linux, and Windows.
 
 ---
 
