@@ -33,7 +33,9 @@ class TelegramBot:
         self.api_url = f"https://api.telegram.org/bot{self.token}"
         self.admin_id = config.telegram_admin_id
         self._http: httpx.AsyncClient | None = None
-        self._active_sessions: dict[int, dict[str, Any]] = {}  # chat_id -> state
+        self._card_sessions: dict[int, dict[str, Any]] = {}  # message_id -> card state
+        self._active_sessions: dict[int, dict[str, Any]] = {}  # chat_id -> fallback state
+        self._active_mints: dict[str, dict[str, Any]] = {}  # job_id -> active mint job
         self._active_mint_tasks: dict[int, asyncio.Task] = {}  # chat_id -> active mint execution task
 
     async def get_http(self) -> httpx.AsyncClient:
@@ -139,11 +141,12 @@ class TelegramBot:
             f"🚀 <b>Lead Broadcast:</b> {self.config.broadcast_lead_ms} ms\n\n"
             "<b>Quick Commands:</b>\n"
             "• <code>/mint &lt;url_or_contract&gt;</code> - Inspect Drop (or paste URL/Contract directly)\n"
+            "• <code>/mints</code> - View Active/Scheduled Drops\n"
             "• <code>/wallets</code> - Manage Wallets & Balances\n"
             "• <code>/addwallet &lt;private_key&gt;</code> - Add New Wallet\n"
             "• <code>/balance</code> - Check All Wallet Balances\n"
             "• <code>/doctor</code> - Run Connectivity & RPC Diagnostic\n"
-            "• <code>/cancel</code> - Cancel Active Mint"
+            "• <code>/cancel [all]</code> - Cancel Active Mint(s)"
         )
 
         keyboard = {
@@ -168,7 +171,9 @@ class TelegramBot:
         try:
             coll = await self.opensea.fetch_collection(locator, chain_client=self.chain)
             initial_stage = coll.stages[0] if coll.stages else None
-            self._active_sessions[chat_id] = {
+            card_state = {
+                "message_id": msg_id,
+                "chat_id": chat_id,
                 "collection": coll,
                 "selected_stage": initial_stage,
                 "quantity": 1,
@@ -179,6 +184,8 @@ class TelegramBot:
                 "expected_price_unit": initial_stage.price_unit if initial_stage else 0.0,
                 "expected_price_symbol": initial_stage.price_symbol if initial_stage else "ETH",
             }
+            self._card_sessions[msg_id] = card_state
+            self._active_sessions[chat_id] = card_state
 
             await self.render_mint_card(chat_id, msg_id)
         except Exception as e:
@@ -189,7 +196,7 @@ class TelegramBot:
             )
 
     async def render_mint_card(self, chat_id: int, message_id: int) -> None:
-        session = self._active_sessions.get(chat_id)
+        session = self._card_sessions.get(message_id) or self._active_sessions.get(chat_id)
         if not session:
             return
 
@@ -369,8 +376,15 @@ class TelegramBot:
 
         await self.edit_message(chat_id, message_id, text, reply_markup={"inline_keyboard": buttons})
 
-    async def handle_mint_launch(self, chat_id: int, message_id: int) -> None:
-        session = self._active_sessions.get(chat_id)
+    async def handle_mint_launch(
+        self,
+        chat_id: int,
+        message_id: int,
+        job_id: str | None = None,
+        session: dict[str, Any] | None = None,
+    ) -> None:
+        if session is None:
+            session = self._card_sessions.get(message_id) or self._active_sessions.get(chat_id)
         if not session:
             await self.send_message(chat_id, "⚠️ Mint session expired. Please run /mint again.")
             return
@@ -384,6 +398,24 @@ class TelegramBot:
         if not wallets:
             await self.send_message(chat_id, "⚠️ <b>No wallets selected!</b> Please tap a wallet button on the card above to select at least 1 wallet.")
             return
+
+        if not job_id:
+            job_id = f"{coll.slug[:10]}_{message_id}"
+
+        # Dedicated engine instance for this drop to ensure complete cancellation & execution isolation
+        job_engine = MintEngine(self.config, self.chain, self.opensea)
+        current_task = asyncio.current_task()
+        self._active_mints[job_id] = {
+            "job_id": job_id,
+            "collection_name": coll.name,
+            "collection_slug": coll.slug,
+            "stage_label": stage.label,
+            "engine": job_engine,
+            "task": current_task,
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "start_time": time.time(),
+        }
 
         # Upfront eligibility & per-wallet price verification BEFORE schedule or fire!
         eth_usd_rate = await get_eth_usd_rate()
@@ -514,22 +546,28 @@ class TelegramBot:
             )
 
         async def on_progress(status_text: str) -> None:
-            # If during countdown or pre-signing wait phase, attach a 🛑 Cancel Scheduled Mint button!
+            active_count = sum(1 for m in self._active_mints.values() if m.get("task") and not m["task"].done())
+            prefix = ""
+            if active_count > 1 and f"[{coll.name}]" not in status_text and coll.name not in status_text:
+                prefix = f"🏷️ <b>[{coll.name}]</b>\n"
+            formatted_text = f"{prefix}{status_text}"
+
+            # If during countdown or pre-signing wait phase, attach a collection-specific cancel button!
             is_countdown = any(kw in status_text.lower() for kw in ["countdown", "until mint starts", "mint opens at", "t-"])
             if is_countdown and "firing" not in status_text.lower():
                 keyboard = {
                     "inline_keyboard": [
-                        [{"text": "🛑 Cancel Scheduled Mint", "callback_data": "abort_active_mint"}]
+                        [{"text": f"🛑 Cancel {coll.name[:18]}", "callback_data": f"abort_job_{job_id}"}]
                     ]
                 }
-                await self.send_message(chat_id, status_text, reply_markup=keyboard)
+                await self.send_message(chat_id, formatted_text, reply_markup=keyboard)
             else:
-                await self.send_message(chat_id, status_text)
+                await self.send_message(chat_id, formatted_text)
 
-        await self.edit_message(chat_id, message_id, "🚀 <b>Minting Initiated!</b> Updates will follow below:")
+        await self.edit_message(chat_id, message_id, f"🚀 <b>Minting Initiated for {coll.name}!</b> Updates will follow below:")
 
         try:
-            results: list[WalletMintResult] = await self.engine.execute_mint(
+            results: list[WalletMintResult] = await job_engine.execute_mint(
                 collection=coll,
                 stage=stage,
                 wallets=wallets,
@@ -539,25 +577,27 @@ class TelegramBot:
                 on_progress=on_progress,
             )
         except asyncio.CancelledError:
-            self.engine.cancel()
+            job_engine.cancel()
             await self.send_message(
                 chat_id,
-                "🛑 <b>Mint Operation Cancelled!</b>\nCountdown stopped. Wallets were not charged."
+                f"🛑 <b>Mint Operation for {coll.name} Cancelled!</b>\nCountdown stopped. Wallets were not charged."
             )
             return
         finally:
-            self._active_mint_tasks.pop(chat_id, None)
+            self._active_mints.pop(job_id, None)
+            if self._active_mint_tasks.get(chat_id) == current_task:
+                self._active_mint_tasks.pop(chat_id, None)
 
         if any(r.status.startswith("CANCELLED") for r in results):
             first_cancelled = next(r for r in results if r.status.startswith("CANCELLED"))
             if first_cancelled.status == "CANCELLED_BY_USER":
                 await self.send_message(
                     chat_id,
-                    "🛑 <b>Mint Operation Cancelled by User!</b>\nAll operations and countdowns have been stopped. Wallets were not charged."
+                    f"🛑 <b>Mint for {coll.name} Cancelled by User!</b>\nAll operations and countdowns have been stopped. Wallets were not charged."
                 )
             else:
                 summary_lines = [
-                    "🛑 <b>MINT OPERATION ABORTED BY SAFETY GUARD!</b>\n",
+                    f"🛑 <b>MINT FOR {coll.name.upper()} ABORTED BY SAFETY GUARD!</b>\n",
                     f"⚠️ <b>Reason:</b> {first_cancelled.error_message or first_cancelled.status}",
                     "🛡️ <b>Protection:</b> No transactions were broadcasted. Your wallet balances were not touched.",
                 ]
@@ -572,7 +612,7 @@ class TelegramBot:
         max_confirm_time = max(confirm_times, default=0.0)
         broadcast_ms = max((r.broadcast_time_ms for r in results), default=0)
 
-        summary_lines = ["<b>📊 Final Mint Results:</b>"]
+        summary_lines = [f"<b>📊 Final Mint Results: {coll.name}</b>"]
         if max_total_time > 0:
             max_calldata_ms = max((getattr(r, "calldata_time_ms", 0) for r in results), default=0)
             on_chain_str = f"On-chain: {max_confirm_time:.2f}s (avg: {avg_confirm_time:.2f}s)" if len(confirm_times) > 1 else f"On-chain: {max_confirm_time:.2f}s"
@@ -819,6 +859,8 @@ class TelegramBot:
 
         await self.answer_callback(cb_id)
 
+        session = self._card_sessions.get(msg_id) or self._active_sessions.get(chat_id)
+
         if data == "menu_wallets":
             await self.handle_wallets_menu(chat_id)
         elif data == "menu_balance":
@@ -829,7 +871,6 @@ class TelegramBot:
             await self.handle_settings(chat_id)
         elif data.startswith("stage_"):
             idx = int(data.split("_")[1])
-            session = self._active_sessions.get(chat_id)
             if session:
                 coll: CollectionInfo = session["collection"]
                 if 0 <= idx < len(coll.stages):
@@ -840,18 +881,15 @@ class TelegramBot:
                     session["expected_price_symbol"] = new_stage.price_symbol
                     await self.render_mint_card(chat_id, msg_id)
         elif data == "qty_inc":
-            session = self._active_sessions.get(chat_id)
             if session:
                 session["quantity"] = min(session["quantity"] + 1, 50)
                 await self.render_mint_card(chat_id, msg_id)
         elif data == "qty_dec":
-            session = self._active_sessions.get(chat_id)
             if session:
                 session["quantity"] = max(session["quantity"] - 1, 1)
                 await self.render_mint_card(chat_id, msg_id)
         elif data.startswith("toggle_wallet_"):
             idx = int(data.split("_")[-1])
-            session = self._active_sessions.get(chat_id)
             if session:
                 all_w = self.wallets.get_all()
                 if 0 <= idx < len(all_w):
@@ -863,7 +901,6 @@ class TelegramBot:
                         session["selected_wallets"].append(target_w)
                     await self.render_mint_card(chat_id, msg_id)
         elif data == "wallet_select_all":
-            session = self._active_sessions.get(chat_id)
             if session:
                 stage = session.get("selected_stage")
                 all_w = self.wallets.get_all()
@@ -878,37 +915,88 @@ class TelegramBot:
                     session["selected_wallets"] = list(all_w)
                 await self.render_mint_card(chat_id, msg_id)
         elif data == "wallet_deselect_all":
-            session = self._active_sessions.get(chat_id)
             if session:
                 session["selected_wallets"] = []
                 await self.render_mint_card(chat_id, msg_id)
-        elif data == "abort_active_mint":
-            self.engine.cancel()
-            self._active_sessions.pop(chat_id, None)
-            task = self._active_mint_tasks.pop(chat_id, None)
-            if task and not task.done():
-                task.cancel()
-            await self.send_message(
-                chat_id,
-                "🛑 <b>Scheduled Mint Cancelled!</b>\nCountdown and mint workers stopped. Wallets were not charged."
-            )
-        elif data == "mint_launch":
-            old_task = self._active_mint_tasks.get(chat_id)
-            if old_task and not old_task.done():
+        elif data.startswith("abort_job_"):
+            target_job_id = data.replace("abort_job_", "")
+            job = self._active_mints.pop(target_job_id, None)
+            if job:
+                job["engine"].cancel()
+                task = job.get("task")
+                if task and not task.done():
+                    task.cancel()
+                c_name = job.get("collection_name", "Collection")
                 await self.send_message(
                     chat_id,
-                    "⚠️ A mint operation is already actively running!\nSend /cancel or tap Cancel to stop it first."
+                    f"🛑 <b>Scheduled Mint for {c_name} Cancelled!</b>\nCountdown stopped. Wallets were not charged."
+                )
+            else:
+                await self.send_message(chat_id, "ℹ️ That mint has already completed or was already cancelled.")
+        elif data == "abort_all_mints":
+            cancelled_names = []
+            for jid, job in list(self._active_mints.items()):
+                job["engine"].cancel()
+                task = job.get("task")
+                if task and not task.done():
+                    task.cancel()
+                cancelled_names.append(job.get("collection_name", "Collection"))
+                self._active_mints.pop(jid, None)
+            self.engine.cancel()
+            names_str = ", ".join(f"<b>{n}</b>" for n in cancelled_names) if cancelled_names else "All"
+            await self.send_message(
+                chat_id,
+                f"🛑 <b>All Scheduled Mints Cancelled!</b> ({names_str})\n"
+                f"Countdowns and workers stopped. Wallets were not charged."
+            )
+        elif data == "abort_active_mint":
+            active_jobs = [m for m in self._active_mints.values() if m.get("task") and not m["task"].done()]
+            if len(active_jobs) == 1:
+                job = active_jobs[0]
+                self._active_mints.pop(job["job_id"], None)
+                job["engine"].cancel()
+                if job.get("task") and not job["task"].done():
+                    job["task"].cancel()
+                await self.send_message(
+                    chat_id,
+                    f"🛑 <b>Scheduled Mint for {job['collection_name']} Cancelled!</b>\nCountdown stopped. Wallets were not charged."
+                )
+            elif len(active_jobs) > 1:
+                buttons = [
+                    [{"text": f"🛑 Cancel {m['collection_name'][:20]}", "callback_data": f"abort_job_{m['job_id']}"}]
+                    for m in active_jobs
+                ]
+                buttons.append([{"text": "💥 Cancel ALL Active Mints", "callback_data": "abort_all_mints"}])
+                await self.send_message(
+                    chat_id,
+                    f"⚠️ <b>{len(active_jobs)} Active Mints Running!</b>\nWhich mint would you like to cancel?",
+                    reply_markup={"inline_keyboard": buttons},
+                )
+            else:
+                self.engine.cancel()
+                await self.send_message(chat_id, "ℹ️ No active mints running.")
+        elif data == "mint_launch":
+            if not session:
+                await self.send_message(chat_id, "⚠️ Mint session expired. Please run /mint again.")
+                return
+
+            coll: CollectionInfo = session["collection"]
+            job_id = f"{coll.slug[:10]}_{msg_id}"
+            existing = self._active_mints.get(job_id)
+            if existing and existing.get("task") and not existing["task"].done():
+                await self.send_message(
+                    chat_id,
+                    f"⚠️ Mint for <b>{coll.name}</b> is already actively running or scheduled!\nSee updates in chat."
                 )
                 return
-            task = asyncio.create_task(self.handle_mint_launch(chat_id, msg_id))
+
+            task = asyncio.create_task(self.handle_mint_launch(chat_id, msg_id, job_id=job_id, session=session))
             self._active_mint_tasks[chat_id] = task
         elif data == "mint_cancel":
-            self.engine.cancel()
-            self._active_sessions.pop(chat_id, None)
-            task = self._active_mint_tasks.pop(chat_id, None)
-            if task and not task.done():
-                task.cancel()
-            await self.edit_message(chat_id, msg_id, "❌ Mint cancelled.")
+            self._card_sessions.pop(msg_id, None)
+            if self._active_sessions.get(chat_id, {}).get("message_id") == msg_id:
+                self._active_sessions.pop(chat_id, None)
+            await self.edit_message(chat_id, msg_id, "❌ Mint card cancelled.")
 
     async def handle_message(self, msg: dict[str, Any]) -> None:
         chat_id = msg.get("chat", {}).get("id")
@@ -996,17 +1084,76 @@ class TelegramBot:
         elif text == "/settings" or text == "/config":
             await self.handle_settings(chat_id)
 
-        elif text == "/cancel":
-            self.engine.cancel()
-            self._active_sessions.pop(chat_id, None)
-            task = self._active_mint_tasks.pop(chat_id, None)
-            if task and not task.done():
-                task.cancel()
-            await self.send_message(
-                chat_id,
-                "🛑 <b>Cancelled active mint operations!</b>\n"
-                "Any ongoing countdowns or scheduled mints have been stopped. Your wallet balances were not touched."
-            )
+        elif text in ("/mints", "/active"):
+            active_jobs = [m for m in self._active_mints.values() if m.get("task") and not m["task"].done()]
+            if not active_jobs:
+                await self.send_message(chat_id, "ℹ️ No mints are currently scheduled or executing.")
+            else:
+                lines = [f"📋 <b>Active / Scheduled Mints ({len(active_jobs)}):</b>\n"]
+                buttons = []
+                for idx, m in enumerate(active_jobs):
+                    elapsed = int(time.time() - m["start_time"])
+                    lines.append(
+                        f"<b>{idx+1}. {m['collection_name']}</b>\n"
+                        f"   • Stage: <b>{m['stage_label']}</b>\n"
+                        f"   • Active since: {elapsed}s ago\n"
+                    )
+                    buttons.append([{"text": f"🛑 Cancel {m['collection_name'][:20]}", "callback_data": f"abort_job_{m['job_id']}"}])
+                buttons.append([{"text": "💥 Cancel ALL Mints", "callback_data": "abort_all_mints"}])
+                await self.send_message(
+                    chat_id,
+                    "\n".join(lines),
+                    reply_markup={"inline_keyboard": buttons},
+                )
+
+        elif text == "/cancel" or text.startswith("/cancel"):
+            subcmd = text.replace("/cancel", "").strip().lower()
+            active_jobs = [m for m in self._active_mints.values() if m.get("task") and not m["task"].done()]
+
+            if subcmd == "all":
+                cancelled_names = []
+                for jid, job in list(self._active_mints.items()):
+                    job["engine"].cancel()
+                    if job.get("task") and not job["task"].done():
+                        job["task"].cancel()
+                    cancelled_names.append(job.get("collection_name", "Collection"))
+                    self._active_mints.pop(jid, None)
+                self.engine.cancel()
+                self._active_sessions.pop(chat_id, None)
+                names_str = ", ".join(f"<b>{n}</b>" for n in cancelled_names) if cancelled_names else "All"
+                await self.send_message(
+                    chat_id,
+                    f"🛑 <b>Cancelled all active mint operations!</b> ({names_str})\n"
+                    "All ongoing countdowns and workers have been stopped. Wallet balances were not touched."
+                )
+            elif len(active_jobs) == 0:
+                self.engine.cancel()
+                self._active_sessions.pop(chat_id, None)
+                await self.send_message(chat_id, "ℹ️ No active or scheduled mints are currently running.")
+            elif len(active_jobs) == 1:
+                job = active_jobs[0]
+                jid = job["job_id"]
+                job["engine"].cancel()
+                if job.get("task") and not job["task"].done():
+                    job["task"].cancel()
+                self._active_mints.pop(jid, None)
+                await self.send_message(
+                    chat_id,
+                    f"🛑 <b>Cancelled active mint for {job['collection_name']}!</b>\n"
+                    "Countdown and mint workers stopped. Wallet balances were not touched."
+                )
+            else:
+                buttons = [
+                    [{"text": f"🛑 Cancel {m['collection_name'][:20]}", "callback_data": f"abort_job_{m['job_id']}"}]
+                    for m in active_jobs
+                ]
+                buttons.append([{"text": "💥 Cancel ALL Mints", "callback_data": "abort_all_mints"}])
+                await self.send_message(
+                    chat_id,
+                    f"⚠️ <b>{len(active_jobs)} Active Mints Running!</b>\n"
+                    f"Choose which drop to cancel, or tap Cancel ALL:",
+                    reply_markup={"inline_keyboard": buttons},
+                )
 
     # ------------------ Telegram Polling Loop ------------------
 

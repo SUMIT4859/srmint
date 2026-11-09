@@ -105,18 +105,21 @@ python bot.py
 | `/balance` | Check native balances across all wallets simultaneously |
 | `/doctor` | Test RPC latency, block time sync, OpenSea API connectivity, and wallet readiness |
 | `/settings` | View current gas limit, RPC endpoint, fee multipliers, and broadcast lead time |
-| `/cancel` | Cancel an ongoing scheduled countdown |
+| `/mints` or `/active` | View all currently scheduled or executing drops with status and selective cancel buttons |
+| `/cancel [all]` | Cancel an active scheduled mint (or `/cancel all` to stop all running drops) |
 
 ---
 
 ## 🚀 How the Speed Architecture Works
 
-1. **Direct On-Chain SeaDrop Execution**:
+1. **Simultaneous Multi-Drop Minting & Card Isolation**:
+   Schedule and fire multiple drops occurring at the exact same second or overlapping times without waiting for previous drops to finish. Each drop card maintains an independent session, and `NonceTracker` automatically assigns sequential, collision-free nonces across concurrent drops sharing wallets.
+2. **Direct On-Chain SeaDrop Execution**:
    For Public mint stages, the bot encodes the canonical SeaDrop selector `0x161ac21f` (`mintPublic`) directly on-chain. It does **not** rely on OpenSea's GraphQL server at mint time, completely eliminating server delays.
-2. **T-10s Pre-Signing**:
+3. **T-10s Pre-Signing**:
    At 10 seconds before the drop opens, the bot fetches nonces and dynamic gas fees across all wallets in parallel and signs the raw transactions locally.
-3. **Simultaneous Parallel Broadcast**:
+4. **Simultaneous Parallel Broadcast**:
    At T-0 (with customizable lead time, e.g. 80ms before open to compensate for network latency), the bot blasts all pre-signed transactions to the RPC concurrently using `asyncio.gather`.
-4. **Heartbeat Session Keeper**:
-   Fixes the timeout issue where watching a countdown caused SIWE sessions or HTTP connections to drop. Background heartbeats keep sessions hot every 25 seconds.
+5. **Heartbeat Session Keeper**:
+   Fixes the timeout issue where watching a countdown caused SIWE sessions or HTTP connections to drop. Background heartbeats keep sessions hot every 25 seconds per collection.
 

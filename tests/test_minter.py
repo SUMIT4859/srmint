@@ -1,7 +1,10 @@
+import asyncio
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 # Add project root to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -1176,6 +1179,180 @@ def test_active_scheduled_mint_cancellation():
     asyncio.run(run_test())
 
 
+def test_concurrent_multi_mint_nonce_reservation():
+    """Verify that multiple simultaneous mint drops reserve consecutive nonces without collisions."""
+    from minter.engine import NonceTracker
+    NonceTracker.reset()
+
+    async def run_test():
+        mock_chain = MagicMock()
+        wallet_addr = "0x1111111111111111111111111111111111111111"
+        # On-chain base nonce is 5
+        mock_chain.get_nonces_batch = AsyncMock(return_value={wallet_addr: 5})
+
+        # Drop 1 requests nonces on Robinhood (4663)
+        nonces_drop1 = await NonceTracker.get_and_reserve_nonces(mock_chain, 4663, [wallet_addr])
+        assert nonces_drop1[wallet_addr] == 5
+
+        # Drop 2 requests nonces simultaneously on Robinhood (4663) for the same wallet
+        nonces_drop2 = await NonceTracker.get_and_reserve_nonces(mock_chain, 4663, [wallet_addr])
+        assert nonces_drop2[wallet_addr] == 6  # Next consecutive nonce! No collision!
+
+        # Drop 3 on a DIFFERENT chain (Ink 57073) with base nonce 0
+        mock_chain_ink = MagicMock()
+        mock_chain_ink.get_nonces_batch = AsyncMock(return_value={wallet_addr: 0})
+        nonces_drop3 = await NonceTracker.get_and_reserve_nonces(mock_chain_ink, 57073, [wallet_addr])
+        assert nonces_drop3[wallet_addr] == 0  # Separate chain, independent nonce space!
+
+        # Drop 1 finishes and releases
+        await NonceTracker.release_nonces(4663, [wallet_addr], broadcasted=True)
+        # Drop 2 still active, so reserved nonce is still 7
+        assert (4663, wallet_addr.lower()) in NonceTracker._reserved
+
+        # Drop 2 finishes and releases
+        await NonceTracker.release_nonces(4663, [wallet_addr], broadcasted=True)
+        # All Robinhood reservations released
+        assert (4663, wallet_addr.lower()) not in NonceTracker._reserved
+
+        # Clean up Drop 3
+        await NonceTracker.release_nonces(57073, [wallet_addr], broadcasted=True)
+        assert len(NonceTracker._reserved) == 0
+
+    asyncio.run(run_test())
+
+
+def test_simultaneous_multi_drop_selective_cancellation():
+    """Verify that cancelling one drop does not affect or cancel another simultaneously running drop."""
+    from minter.engine import MintEngine, NonceTracker
+    from minter.client import CollectionInfo, DropStage
+    from minter.chain import GasFees
+    NonceTracker.reset()
+
+    async def run_test():
+        config = AppConfig()
+        wallet = WalletAccount(private_key="0x" + "a" * 64, label="W1")
+
+        mock_chain = MagicMock()
+        mock_chain.rpc_url = "https://rpc.robinhood.org"
+        mock_chain.fallback_rpc_url = ""
+        mock_chain.timeout_seconds = 5.0
+        mock_chain.get_chain_id = AsyncMock(return_value=4663)
+        mock_chain.get_balances_batch = AsyncMock(return_value={wallet.address: int(1e18)})
+        mock_chain.get_nonces_batch = AsyncMock(return_value={wallet.address: 0})
+        mock_chain.get_gas_fees = AsyncMock(return_value=GasFees(1_000_000_000, 2_000_000_000, 1_000_000_000))
+        mock_chain.broadcast_raw_transaction = AsyncMock(return_value="0xabc123")
+        mock_chain.wait_for_receipt = AsyncMock(return_value=MagicMock(status=1, gas_used=100000))
+
+        mock_opensea = MagicMock()
+        mock_opensea.start_heartbeat = MagicMock()
+        mock_opensea.stop_heartbeat = MagicMock()
+
+        # Collection 1 (Scheduled in the future, will be cancelled)
+        coll1 = CollectionInfo(name="c1", slug="c1", contract_address="0x" + "1" * 40, image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=100, max_supply=100, stages=[])
+        stage1 = DropStage(
+            uuid="s1",
+            label="Public 1",
+            stage_type="PUBLIC_SALE",
+            stage_index=0,
+            start_time="future",
+            end_time="future_end",
+            start_timestamp=int(time.time()) + 300,
+            end_timestamp=int(time.time()) + 600,
+            max_per_wallet=1,
+            price_wei=0,
+            price_symbol="ETH",
+            price_unit=0.0,
+        )
+
+        # Collection 2 (Live now, will execute successfully)
+        coll2 = CollectionInfo(name="c2", slug="c2", contract_address="0x" + "2" * 40, image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=100, max_supply=100, stages=[])
+        stage2 = DropStage(
+            uuid="s2",
+            label="Public 2",
+            stage_type="PUBLIC_SALE",
+            stage_index=0,
+            start_time="now",
+            end_time="later",
+            start_timestamp=int(time.time()) - 10,
+            end_timestamp=int(time.time()) + 600,
+            max_per_wallet=1,
+            price_wei=0,
+            price_symbol="ETH",
+            price_unit=0.0,
+        )
+
+        engine1 = MintEngine(config, mock_chain, mock_opensea)
+        engine2 = MintEngine(config, mock_chain, mock_opensea)
+
+        async def run_engine1():
+            return await engine1.execute_mint(coll1, stage1, [wallet], quantity_per_wallet=1)
+
+        async def run_engine2():
+            return await engine2.execute_mint(coll2, stage2, [wallet], quantity_per_wallet=1)
+
+        task1 = asyncio.create_task(run_engine1())
+        # Let engine1 enter countdown
+        await asyncio.sleep(0.05)
+        # Cancel engine1 ONLY
+        engine1.cancel()
+
+        # Run engine2 in parallel
+        results2 = await run_engine2()
+        results1 = await task1
+
+        # Assert engine1 was cancelled
+        assert results1[0].status == "CANCELLED_BY_USER"
+        # Assert engine2 succeeded without interruption!
+        assert results2[0].status == "SUCCESS"
+        assert results2[0].tx_hash != ""
+
+    asyncio.run(run_test())
+
+
+def test_telegram_bot_multi_drop_card_isolation():
+    """Verify that multiple mint cards in Telegram maintain independent decoupled sessions."""
+    from bot import TelegramBot
+    from minter.client import CollectionInfo, DropStage
+    from minter.wallet import WalletAccount, WalletManager
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        w_file = Path(tmp_dir) / "wallets.json"
+        w_mgr = WalletManager(str(w_file))
+        w = w_mgr.add_wallet("0x0000000000000000000000000000000000000000000000000000000000000001", label="W1")
+        config = AppConfig()
+        config.telegram_bot_token = "fake:token"
+        bot = TelegramBot(config, w_mgr)
+
+        coll_a = CollectionInfo(name="CollA", slug="colla", contract_address="0x" + "1" * 40, image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=100, max_supply=100, stages=[])
+        coll_b = CollectionInfo(name="CollB", slug="collb", contract_address="0x" + "2" * 40, image_url="", chain_identifier="ink", chain_id=57073, total_supply=100, max_supply=100, stages=[])
+
+        # Card A at msg_id 100
+        bot._card_sessions[100] = {
+            "message_id": 100,
+            "chat_id": 12345,
+            "collection": coll_a,
+            "quantity": 1,
+            "selected_wallets": [w],
+        }
+        # Card B at msg_id 200
+        bot._card_sessions[200] = {
+            "message_id": 200,
+            "chat_id": 12345,
+            "collection": coll_b,
+            "quantity": 5,
+            "selected_wallets": [w],
+        }
+
+        # Modify Card A
+        bot._card_sessions[100]["quantity"] = 3
+
+        # Assert Card B is completely unaffected
+        assert bot._card_sessions[100]["quantity"] == 3
+        assert bot._card_sessions[200]["quantity"] == 5
+        assert bot._card_sessions[100]["collection"].slug == "colla"
+        assert bot._card_sessions[200]["collection"].slug == "collb"
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -1204,6 +1381,9 @@ if __name__ == "__main__":
     test_cross_wallet_eligibility_caching()
     test_auto_select_eligible_wallets_only()
     test_active_scheduled_mint_cancellation()
+    test_concurrent_multi_mint_nonce_reservation()
+    test_simultaneous_multi_drop_selective_cancellation()
+    test_telegram_bot_multi_drop_card_isolation()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

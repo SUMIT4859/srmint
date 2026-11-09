@@ -256,6 +256,7 @@ class OpenSeaClient:
         self._wallet_sessions: dict[str, dict[str, str]] = {}  # address -> cookies/headers
         self._wallet_tokens: dict[str, str] = {}  # address -> access_token
         self._heartbeat_task: asyncio.Task | None = None
+        self._heartbeat_tasks: dict[str, asyncio.Task] = {}  # slug -> heartbeat task
         self._authenticated_wallets: set[str] = set()  # address -> authenticated
         self._wallet_stage_elig_cache: dict[tuple[str, str], dict[str, WalletEligibility]] = {}
 
@@ -316,12 +317,25 @@ class OpenSeaClient:
 
     def start_heartbeat(self, slug: str, wallets: list[WalletAccount], interval_seconds: int = 25) -> None:
         """Start background session keepalive to prevent timeouts during long waits."""
-        self.stop_heartbeat()
-        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(slug, wallets, interval_seconds))
+        self.stop_heartbeat(slug)
+        task = asyncio.create_task(self._heartbeat_loop(slug, wallets, interval_seconds))
+        self._heartbeat_tasks[slug] = task
+        self._heartbeat_task = task
 
-    def stop_heartbeat(self) -> None:
-        if self._heartbeat_task and not self._heartbeat_task.done():
-            self._heartbeat_task.cancel()
+    def stop_heartbeat(self, slug: str | None = None) -> None:
+        if slug is not None:
+            task = self._heartbeat_tasks.pop(slug, None)
+            if task and not task.done():
+                task.cancel()
+            if self._heartbeat_task == task:
+                self._heartbeat_task = None
+        else:
+            for task in self._heartbeat_tasks.values():
+                if not task.done():
+                    task.cancel()
+            self._heartbeat_tasks.clear()
+            if self._heartbeat_task and not self._heartbeat_task.done():
+                self._heartbeat_task.cancel()
             self._heartbeat_task = None
 
     async def _heartbeat_loop(self, slug: str, wallets: list[WalletAccount], interval_seconds: int) -> None:

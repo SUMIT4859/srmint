@@ -40,6 +40,58 @@ class WalletMintResult:
     total_time_seconds: float = 0.0
 
 
+class NonceTracker:
+    """Thread/coroutine-safe nonce reservation to prevent collisions across concurrent drops."""
+
+    _lock = asyncio.Lock()
+    _reserved: dict[tuple[int, str], int] = {}
+    _active_counts: dict[tuple[int, str], int] = {}
+
+    @classmethod
+    async def get_and_reserve_nonces(
+        cls,
+        chain_client: ChainClient,
+        chain_id: int,
+        addresses: list[str],
+    ) -> dict[str, int]:
+        async with cls._lock:
+            on_chain_nonces = await chain_client.get_nonces_batch(addresses)
+            assigned_nonces: dict[str, int] = {}
+            for addr in addresses:
+                key = (chain_id, addr.lower())
+                base_on_chain = on_chain_nonces.get(addr, 0)
+                current_reserved = cls._reserved.get(key, base_on_chain)
+                assigned_nonce = max(base_on_chain, current_reserved)
+                assigned_nonces[addr] = assigned_nonce
+                cls._reserved[key] = assigned_nonce + 1
+                cls._active_counts[key] = cls._active_counts.get(key, 0) + 1
+            return assigned_nonces
+
+    @classmethod
+    async def release_nonces(
+        cls,
+        chain_id: int,
+        addresses: list[str],
+        broadcasted: bool = True,
+    ) -> None:
+        async with cls._lock:
+            for addr in addresses:
+                key = (chain_id, addr.lower())
+                if key in cls._active_counts:
+                    cls._active_counts[key] -= 1
+                    if cls._active_counts[key] <= 0:
+                        cls._active_counts.pop(key, None)
+                        cls._reserved.pop(key, None)
+                    elif not broadcasted:
+                        if key in cls._reserved:
+                            cls._reserved[key] = max(0, cls._reserved[key] - 1)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls._reserved.clear()
+        cls._active_counts.clear()
+
+
 class MintEngine:
     def __init__(self, config: AppConfig, chain: ChainClient, opensea: OpenSeaClient) -> None:
         self.config = config
@@ -79,6 +131,8 @@ class MintEngine:
         on_progress: Callable[[str], asyncio.Future[Any] | Any] | None = None,
     ) -> list[WalletMintResult]:
         self._cancel_requested = False
+        nonces_reserved = False
+        broadcast_started = False
         if wallet_quantities is None:
             wallet_quantities = {w.address: quantity_per_wallet for w in wallets}
         else:
@@ -219,8 +273,9 @@ class MintEngine:
             # 4. T-10 Preparation & Pre-Signing Phase
             await notify("🚀 T-10s: Pre-fetching nonces & pre-signing transactions for all wallets...")
 
-            # Concurrently fetch nonces
-            nonces = await active_chain.get_nonces_batch(addresses)
+            # Concurrently fetch nonces with concurrent drop collision protection
+            nonces = await NonceTracker.get_and_reserve_nonces(active_chain, chain_id, addresses)
+            nonces_reserved = True
 
             # Fetch gas fees with boost multiplier
             fee_mult = (
@@ -438,6 +493,7 @@ class MintEngine:
 
             # 6. INSTANT PIPELINED BROADCAST (Zero synchronous network delay at T-0)
             asyncio.create_task(notify("⚡ T-0: FIRING TRANSACTIONS TO RPC! 🚀"))
+            broadcast_started = True
             broadcast_start = time.time()
 
             async def broadcast_presigned(w_addr: str, raw_bytes: bytes) -> None:
@@ -611,7 +667,12 @@ class MintEngine:
             return results
 
         finally:
-            self.opensea.stop_heartbeat()
+            try:
+                self.opensea.stop_heartbeat(collection.slug)
+            except TypeError:
+                self.opensea.stop_heartbeat()
+            if nonces_reserved:
+                await NonceTracker.release_nonces(chain_id, addresses, broadcasted=broadcast_started)
             if should_close_active_chain:
                 await active_chain.close()
 
