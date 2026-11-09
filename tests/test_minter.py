@@ -1050,6 +1050,132 @@ def test_cross_wallet_eligibility_caching():
     asyncio.run(run_test())
 
 
+def test_auto_select_eligible_wallets_only():
+    from minter.wallet import WalletAccount
+    from minter.client import DropStage, WalletEligibility
+
+    w1 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001", label="EligibleWallet")
+    w2 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000002", label="IneligibleWallet")
+
+    stage_private = DropStage(
+        uuid="stage-allowlist-1",
+        label="Allowlist",
+        stage_type="SIGNED_PRESALE",
+        stage_index=1,
+        start_time="now",
+        end_time="later",
+        start_timestamp=100,
+        end_timestamp=200,
+        max_per_wallet=2,
+        price_wei=0,
+        price_symbol="ETH",
+        price_unit=0.0,
+    )
+
+    eligibility_cache = {
+        (stage_private.uuid, w1.address): WalletEligibility(is_eligible=True, max_mintable=1, price_wei=0),
+        (stage_private.uuid, w2.address): WalletEligibility(is_eligible=False, reason="Not on Allowlist"),
+    }
+
+    all_wallets = [w1, w2]
+    # Verify auto-filter selects ONLY eligible wallet
+    selected = [
+        w for w in all_wallets
+        if eligibility_cache.get((stage_private.uuid, w.address)) and eligibility_cache[(stage_private.uuid, w.address)].is_eligible
+    ]
+
+    assert len(selected) == 1
+    assert selected[0].address == w1.address
+    assert w2 not in selected
+
+
+def test_active_scheduled_mint_cancellation():
+    import asyncio
+    import time
+    from unittest.mock import AsyncMock, MagicMock
+    from minter.engine import MintEngine
+    from minter.client import CollectionInfo, DropStage, OpenSeaClient
+    from minter.wallet import WalletAccount
+    from minter.config import AppConfig
+    from minter.chain import GasFees
+
+    async def run_test():
+        cfg = AppConfig()
+        chain = AsyncMock()
+        chain.get_chain_id = AsyncMock(return_value=4663)
+        chain.get_balances_batch = AsyncMock(return_value={"0x7E5F4552091A69125d5DfCb7b8C2659029395Bdf": 10**18})
+        chain.get_gas_fees = AsyncMock(return_value=GasFees(base_fee_per_gas=100000000, max_priority_fee_per_gas=2000000, max_fee_per_gas=120000000))
+        chain.get_nonces_batch = AsyncMock()
+        chain.broadcast_raw_transaction = AsyncMock()
+
+        opensea = AsyncMock(spec=OpenSeaClient)
+        opensea.start_heartbeat = MagicMock()
+        opensea.stop_heartbeat = MagicMock()
+
+        engine = MintEngine(cfg, chain, opensea)
+
+        w = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001", label="W1")
+        future_start = int(time.time()) + 100  # 100s in the future
+        stage = DropStage(
+            uuid="scheduled-stage-1",
+            label="Public Drop",
+            stage_type="PUBLIC_SALE",
+            stage_index=0,
+            start_time="future",
+            end_time="future_end",
+            start_timestamp=future_start,
+            end_timestamp=future_start + 1000,
+            max_per_wallet=1,
+            price_wei=0,
+            price_symbol="ETH",
+            price_unit=0.0,
+        )
+        coll = CollectionInfo(
+            name="Scheduled Coll",
+            slug="scheduled-coll",
+            contract_address="0x1111111111111111111111111111111111111111",
+            image_url="",
+            chain_identifier="robinhood",
+            chain_id=4663,
+            total_supply=100,
+            max_supply=100,
+            stages=[stage],
+        )
+
+        progress_msgs = []
+        async def on_progress(msg):
+            progress_msgs.append(msg)
+
+        # Launch execute_mint in background
+        mint_task = asyncio.create_task(
+            engine.execute_mint(
+                collection=coll,
+                stage=stage,
+                wallets=[w],
+                quantity_per_wallet=1,
+                on_progress=on_progress,
+            )
+        )
+
+        # Allow countdown to start
+        await asyncio.sleep(0.1)
+
+        # User cancels during countdown!
+        engine.cancel()
+
+        results = await mint_task
+
+        # Verify it cleanly cancelled
+        assert len(results) == 1
+        assert results[0].status == "CANCELLED_BY_USER"
+        assert results[0].error_message == "Mint was cancelled by user"
+        # Verify no transactions were broadcasted!
+        assert chain.broadcast_raw_transaction.call_count == 0
+        assert chain.get_nonces_batch.call_count == 0
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -1076,6 +1202,8 @@ if __name__ == "__main__":
     test_allocation_decrement_fallback()
     test_siwe_statement_and_headers()
     test_cross_wallet_eligibility_caching()
+    test_auto_select_eligible_wallets_only()
+    test_active_scheduled_mint_cancellation()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

@@ -34,6 +34,7 @@ class TelegramBot:
         self.admin_id = config.telegram_admin_id
         self._http: httpx.AsyncClient | None = None
         self._active_sessions: dict[int, dict[str, Any]] = {}  # chat_id -> state
+        self._active_mint_tasks: dict[int, asyncio.Task] = {}  # chat_id -> active mint execution task
 
     async def get_http(self) -> httpx.AsyncClient:
         if self._http is None or self._http.is_closed:
@@ -218,8 +219,6 @@ class TelegramBot:
             guard_label = f"{stage.price_unit} {stage.price_symbol}"
 
         all_configured_wallets = self.wallets.get_all()
-        selected_addrs = {w.address for w in wallets}
-
         eth_usd_rate = await get_eth_usd_rate()
 
         # Check eligibility upfront for private/allowlist stages
@@ -245,6 +244,22 @@ class TelegramBot:
                         eligibility_cache[(stage.uuid, w.address)] = WalletEligibility(False, reason="Check Failed")
 
                 await asyncio.gather(*(fetch_one(w) for w in uncached))
+
+        # Automatically select ONLY eligible wallets on stage load or when switching stages
+        if session.get("auto_filtered_stage") != stage.uuid:
+            if not stage.is_public:
+                eligible_wallets = [
+                    w for w in all_configured_wallets
+                    if eligibility_cache.get((stage.uuid, w.address)) and eligibility_cache[(stage.uuid, w.address)].is_eligible
+                ]
+                session["selected_wallets"] = eligible_wallets
+                wallets = eligible_wallets
+            else:
+                session["selected_wallets"] = list(all_configured_wallets)
+                wallets = list(all_configured_wallets)
+            session["auto_filtered_stage"] = stage.uuid
+
+        selected_addrs = {w.address for w in wallets}
 
         wallet_lines = []
         for idx, w in enumerate(all_configured_wallets):
@@ -499,47 +514,72 @@ class TelegramBot:
             )
 
         async def on_progress(status_text: str) -> None:
-            await self.send_message(chat_id, status_text)
+            # If during countdown or pre-signing wait phase, attach a 🛑 Cancel Scheduled Mint button!
+            is_countdown = any(kw in status_text.lower() for kw in ["countdown", "until mint starts", "mint opens at", "t-"])
+            if is_countdown and "firing" not in status_text.lower():
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "🛑 Cancel Scheduled Mint", "callback_data": "abort_active_mint"}]
+                    ]
+                }
+                await self.send_message(chat_id, status_text, reply_markup=keyboard)
+            else:
+                await self.send_message(chat_id, status_text)
 
         await self.edit_message(chat_id, message_id, "🚀 <b>Minting Initiated!</b> Updates will follow below:")
 
-        results: list[WalletMintResult] = await self.engine.execute_mint(
-            collection=coll,
-            stage=stage,
-            wallets=wallets,
-            quantity_per_wallet=qty,
-            wallet_quantities=wallet_quantities,
-            expected_price_wei=expected_price_wei,
-            on_progress=on_progress,
-        )
+        try:
+            results: list[WalletMintResult] = await self.engine.execute_mint(
+                collection=coll,
+                stage=stage,
+                wallets=wallets,
+                quantity_per_wallet=qty,
+                wallet_quantities=wallet_quantities,
+                expected_price_wei=expected_price_wei,
+                on_progress=on_progress,
+            )
+        except asyncio.CancelledError:
+            self.engine.cancel()
+            await self.send_message(
+                chat_id,
+                "🛑 <b>Mint Operation Cancelled!</b>\nCountdown stopped. Wallets were not charged."
+            )
+            return
+        finally:
+            self._active_mint_tasks.pop(chat_id, None)
 
         if any(r.status.startswith("CANCELLED") for r in results):
             first_cancelled = next(r for r in results if r.status.startswith("CANCELLED"))
-            summary_lines = [
-                "🛑 <b>MINT OPERATION ABORTED BY SAFETY GUARD!</b>\n",
-                f"⚠️ <b>Reason:</b> {first_cancelled.error_message or first_cancelled.status}",
-                "🛡️ <b>Protection:</b> No transactions were broadcasted. Your wallet balances were not touched.",
-            ]
-            await self.send_message(chat_id, "\n".join(summary_lines))
+            if first_cancelled.status == "CANCELLED_BY_USER":
+                await self.send_message(
+                    chat_id,
+                    "🛑 <b>Mint Operation Cancelled by User!</b>\nAll operations and countdowns have been stopped. Wallets were not charged."
+                )
+            else:
+                summary_lines = [
+                    "🛑 <b>MINT OPERATION ABORTED BY SAFETY GUARD!</b>\n",
+                    f"⚠️ <b>Reason:</b> {first_cancelled.error_message or first_cancelled.status}",
+                    "🛡️ <b>Protection:</b> No transactions were broadcasted. Your wallet balances were not touched.",
+                ]
+                await self.send_message(chat_id, "\n".join(summary_lines))
             return
 
         # Final Summary
         total_success = sum(1 for r in results if r.status == "SUCCESS")
         max_total_time = max((r.total_time_seconds for r in results if r.total_time_seconds > 0), default=0.0)
-        avg_confirm_time = (
-            sum(r.confirm_time_seconds for r in results if r.confirm_time_seconds > 0) / max(1, total_success)
-            if total_success > 0
-            else 0.0
-        )
+        confirm_times = [r.confirm_time_seconds for r in results if r.confirm_time_seconds > 0]
+        avg_confirm_time = sum(confirm_times) / max(1, len(confirm_times)) if confirm_times else 0.0
+        max_confirm_time = max(confirm_times, default=0.0)
         broadcast_ms = max((r.broadcast_time_ms for r in results), default=0)
 
         summary_lines = ["<b>📊 Final Mint Results:</b>"]
         if max_total_time > 0:
             max_calldata_ms = max((getattr(r, "calldata_time_ms", 0) for r in results), default=0)
+            on_chain_str = f"On-chain: {max_confirm_time:.2f}s (avg: {avg_confirm_time:.2f}s)" if len(confirm_times) > 1 else f"On-chain: {max_confirm_time:.2f}s"
             if max_calldata_ms > 0:
-                breakdown = f"OpenSea: {max_calldata_ms}ms | RPC: {broadcast_ms}ms | On-chain: {avg_confirm_time:.2f}s"
+                breakdown = f"OpenSea: {max_calldata_ms}ms | RPC: {broadcast_ms}ms | {on_chain_str}"
             else:
-                breakdown = f"Broadcast: {broadcast_ms}ms | On-chain: {avg_confirm_time:.2f}s"
+                breakdown = f"Direct SeaDrop (0ms OS) | RPC: {broadcast_ms}ms | {on_chain_str}"
             summary_lines.append(
                 f"⏱️ <b>Total Time Taken:</b> <b>{max_total_time:.2f}s</b> ({breakdown})\n"
             )
@@ -825,19 +865,148 @@ class TelegramBot:
         elif data == "wallet_select_all":
             session = self._active_sessions.get(chat_id)
             if session:
-                session["selected_wallets"] = list(self.wallets.get_all())
+                stage = session.get("selected_stage")
+                all_w = self.wallets.get_all()
+                if stage and not stage.is_public:
+                    elig_cache = session.get("eligibility_cache", {})
+                    elig_w = [
+                        w for w in all_w
+                        if elig_cache.get((stage.uuid, w.address)) and elig_cache[(stage.uuid, w.address)].is_eligible
+                    ]
+                    session["selected_wallets"] = elig_w if elig_w else list(all_w)
+                else:
+                    session["selected_wallets"] = list(all_w)
                 await self.render_mint_card(chat_id, msg_id)
         elif data == "wallet_deselect_all":
             session = self._active_sessions.get(chat_id)
             if session:
                 session["selected_wallets"] = []
                 await self.render_mint_card(chat_id, msg_id)
+        elif data == "abort_active_mint":
+            self.engine.cancel()
+            self._active_sessions.pop(chat_id, None)
+            task = self._active_mint_tasks.pop(chat_id, None)
+            if task and not task.done():
+                task.cancel()
+            await self.send_message(
+                chat_id,
+                "🛑 <b>Scheduled Mint Cancelled!</b>\nCountdown and mint workers stopped. Wallets were not charged."
+            )
         elif data == "mint_launch":
-            await self.handle_mint_launch(chat_id, msg_id)
+            old_task = self._active_mint_tasks.get(chat_id)
+            if old_task and not old_task.done():
+                await self.send_message(
+                    chat_id,
+                    "⚠️ A mint operation is already actively running!\nSend /cancel or tap Cancel to stop it first."
+                )
+                return
+            task = asyncio.create_task(self.handle_mint_launch(chat_id, msg_id))
+            self._active_mint_tasks[chat_id] = task
         elif data == "mint_cancel":
             self.engine.cancel()
             self._active_sessions.pop(chat_id, None)
+            task = self._active_mint_tasks.pop(chat_id, None)
+            if task and not task.done():
+                task.cancel()
             await self.edit_message(chat_id, msg_id, "❌ Mint cancelled.")
+
+    async def handle_message(self, msg: dict[str, Any]) -> None:
+        chat_id = msg.get("chat", {}).get("id")
+        text = msg.get("text", "").strip()
+        msg_id = msg.get("message_id")
+
+        if not text:
+            return
+
+        # Command routing
+        if text == "/start" or text == "/help":
+            await self.handle_start(chat_id)
+
+        elif text.startswith("/mint"):
+            parts = text.split(maxsplit=1)
+            if len(parts) > 1:
+                await self.handle_mint_command(chat_id, parts[1])
+            else:
+                await self.send_message(
+                    chat_id,
+                    "Usage: <code>/mint &lt;url_or_contract&gt;</code>\n\n"
+                    "<b>Examples:</b>\n"
+                    "• <code>/mint https://opensea.io/collection/trenchstrokerz</code>\n"
+                    "• <code>/mint 0x2c8c306f34969d05230bf1c7c8ca6becc8e97e6b</code>\n\n"
+                    "<i>Tip: You can also paste the URL or Contract Address directly!</i>",
+                )
+
+        # Direct paste detection for OpenSea URL or 0x contract address
+        elif (
+            text.startswith("http://")
+            or text.startswith("https://")
+            or (text.startswith("0x") and len(text) == 42)
+        ):
+            await self.handle_mint_command(chat_id, text)
+
+        elif text == "/wallets":
+            await self.handle_wallets_menu(chat_id)
+
+        elif text.startswith("/addwallet"):
+            # Delete the incoming message with private key immediately for security!
+            await self.delete_message(chat_id, msg_id)
+            parts = text.split()
+            if len(parts) >= 2:
+                pk = parts[1]
+                label = parts[2] if len(parts) >= 3 else ""
+                try:
+                    w = self.wallets.add_wallet(pk, label=label)
+                    await self.send_message(
+                        chat_id,
+                        f"✅ <b>Wallet Added:</b> {w.label}\n"
+                        f"Address: <code>{w.address}</code>\n"
+                        f"<i>(Your message containing the key was auto-deleted for security.)</i>",
+                    )
+                except Exception as e:
+                    await self.send_message(chat_id, f"❌ Failed to add wallet: {e}")
+            else:
+                await self.send_message(
+                    chat_id,
+                    "Usage: <code>/addwallet &lt;private_key&gt; [label]</code>",
+                )
+
+        elif text.startswith("/delwallet"):
+            parts = text.split()
+            if len(parts) >= 2 and parts[1].isdigit():
+                idx = int(parts[1]) - 1
+                try:
+                    removed = self.wallets.remove_wallet(idx)
+                    await self.send_message(
+                        chat_id,
+                        f"🗑️ Removed wallet <b>{removed.label}</b> (<code>{removed.short_address}</code>)",
+                    )
+                except Exception as e:
+                    await self.send_message(chat_id, f"❌ Error: {e}")
+            else:
+                await self.send_message(
+                    chat_id, "Usage: <code>/delwallet &lt;number&gt;</code>"
+                )
+
+        elif text == "/balance":
+            await self.handle_wallets_menu(chat_id)
+
+        elif text == "/doctor":
+            await self.handle_doctor(chat_id)
+
+        elif text == "/settings" or text == "/config":
+            await self.handle_settings(chat_id)
+
+        elif text == "/cancel":
+            self.engine.cancel()
+            self._active_sessions.pop(chat_id, None)
+            task = self._active_mint_tasks.pop(chat_id, None)
+            if task and not task.done():
+                task.cancel()
+            await self.send_message(
+                chat_id,
+                "🛑 <b>Cancelled active mint operations!</b>\n"
+                "Any ongoing countdowns or scheduled mints have been stopped. Your wallet balances were not touched."
+            )
 
     # ------------------ Telegram Polling Loop ------------------
 
@@ -876,7 +1045,7 @@ class TelegramBot:
                         cb = update["callback_query"]
                         user_id = cb.get("from", {}).get("id")
                         if self.is_authorized(user_id):
-                            await self.handle_callback(cb)
+                            asyncio.create_task(self.handle_callback(cb))
                         continue
 
                     # Handle Messages
@@ -884,95 +1053,12 @@ class TelegramBot:
                         msg = update["message"]
                         user_id = msg.get("from", {}).get("id")
                         chat_id = msg.get("chat", {}).get("id")
-                        text = msg.get("text", "").strip()
-                        msg_id = msg.get("message_id")
 
                         if not self.is_authorized(user_id):
-                            await self.send_message(chat_id, "⛔ Unauthorized user. This bot is private.")
+                            asyncio.create_task(self.send_message(chat_id, "⛔ Unauthorized user. This bot is private."))
                             continue
 
-                        # Command routing
-                        if text == "/start" or text == "/help":
-                            await self.handle_start(chat_id)
-
-                        elif text.startswith("/mint"):
-                            parts = text.split(maxsplit=1)
-                            if len(parts) > 1:
-                                await self.handle_mint_command(chat_id, parts[1])
-                            else:
-                                await self.send_message(
-                                    chat_id,
-                                    "Usage: <code>/mint &lt;url_or_contract&gt;</code>\n\n"
-                                    "<b>Examples:</b>\n"
-                                    "• <code>/mint https://opensea.io/collection/trenchstrokerz</code>\n"
-                                    "• <code>/mint 0x2c8c306f34969d05230bf1c7c8ca6becc8e97e6b</code>\n\n"
-                                    "<i>Tip: You can also paste the URL or Contract Address directly!</i>",
-                                )
-
-                        # Direct paste detection for OpenSea URL or 0x contract address
-                        elif (
-                            text.startswith("http://")
-                            or text.startswith("https://")
-                            or (text.startswith("0x") and len(text) == 42)
-                        ):
-                            await self.handle_mint_command(chat_id, text)
-
-                        elif text == "/wallets":
-                            await self.handle_wallets_menu(chat_id)
-
-                        elif text.startswith("/addwallet"):
-                            # Delete the incoming message with private key immediately for security!
-                            await self.delete_message(chat_id, msg_id)
-                            parts = text.split()
-                            if len(parts) >= 2:
-                                pk = parts[1]
-                                label = parts[2] if len(parts) >= 3 else ""
-                                try:
-                                    w = self.wallets.add_wallet(pk, label=label)
-                                    await self.send_message(
-                                        chat_id,
-                                        f"✅ <b>Wallet Added:</b> {w.label}\n"
-                                        f"Address: <code>{w.address}</code>\n"
-                                        f"<i>(Your message containing the key was auto-deleted for security.)</i>",
-                                    )
-                                except Exception as e:
-                                    await self.send_message(chat_id, f"❌ Failed to add wallet: {e}")
-                            else:
-                                await self.send_message(
-                                    chat_id,
-                                    "Usage: <code>/addwallet &lt;private_key&gt; [label]</code>",
-                                )
-
-                        elif text.startswith("/delwallet"):
-                            parts = text.split()
-                            if len(parts) >= 2 and parts[1].isdigit():
-                                idx = int(parts[1]) - 1
-                                try:
-                                    removed = self.wallets.remove_wallet(idx)
-                                    await self.send_message(
-                                        chat_id,
-                                        f"🗑️ Removed wallet <b>{removed.label}</b> (<code>{removed.short_address}</code>)",
-                                    )
-                                except Exception as e:
-                                    await self.send_message(chat_id, f"❌ Error: {e}")
-                            else:
-                                await self.send_message(
-                                    chat_id, "Usage: <code>/delwallet &lt;number&gt;</code>"
-                                )
-
-                        elif text == "/balance":
-                            await self.handle_wallets_menu(chat_id)
-
-                        elif text == "/doctor":
-                            await self.handle_doctor(chat_id)
-
-                        elif text == "/settings" or text == "/config":
-                            await self.handle_settings(chat_id)
-
-                        elif text == "/cancel":
-                            self.engine.cancel()
-                            self._active_sessions.pop(chat_id, None)
-                            await self.send_message(chat_id, "🛑 Cancelled active mint operations.")
+                        asyncio.create_task(self.handle_message(msg))
 
             except httpx.TimeoutException:
                 # Normal long polling timeout (no messages from Telegram during poll interval). Continue smoothly.

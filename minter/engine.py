@@ -194,6 +194,9 @@ class MintEngine:
                 while True:
                     if self._cancel_requested:
                         await notify("❌ Minting was cancelled by user.")
+                        for r in results:
+                            r.status = "CANCELLED_BY_USER"
+                            r.error_message = "Mint was cancelled by user"
                         return results
 
                     now_ts = time.time()
@@ -204,10 +207,13 @@ class MintEngine:
                     # Send update at milestones
                     if int(rem_sec) % 30 == 0 or rem_sec in (60, 30, 20, 15):
                         await notify(f"⏳ T-{int(rem_sec)}s until mint starts...")
-                    await asyncio.sleep(min(1.0, rem_sec - 10.0))
+                    await asyncio.sleep(min(0.5, rem_sec - 10.0))
 
             if self._cancel_requested:
                 await notify("❌ Minting cancelled.")
+                for r in results:
+                    r.status = "CANCELLED_BY_USER"
+                    r.error_message = "Mint was cancelled by user"
                 return results
 
             # 4. T-10 Preparation & Pre-Signing Phase
@@ -411,9 +417,24 @@ class MintEngine:
                     except Exception:
                         pass
 
-                rem_final = target_broadcast_time - time.time()
-                if rem_final > 0:
-                    await asyncio.sleep(rem_final)
+                while True:
+                    if self._cancel_requested:
+                        await notify("❌ Minting was cancelled by user before broadcast.")
+                        for r in results:
+                            r.status = "CANCELLED_BY_USER"
+                            r.error_message = "Mint was cancelled by user"
+                        return results
+                    rem_final = target_broadcast_time - time.time()
+                    if rem_final <= 0:
+                        break
+                    await asyncio.sleep(min(0.05, rem_final))
+
+            if self._cancel_requested:
+                await notify("❌ Minting was cancelled by user before broadcast.")
+                for r in results:
+                    r.status = "CANCELLED_BY_USER"
+                    r.error_message = "Mint was cancelled by user"
+                return results
 
             # 6. INSTANT PIPELINED BROADCAST (Zero synchronous network delay at T-0)
             asyncio.create_task(notify("⚡ T-0: FIRING TRANSACTIONS TO RPC! 🚀"))
