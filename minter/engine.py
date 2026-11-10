@@ -172,6 +172,7 @@ class MintEngine:
                 active_chain = ChainClient(
                     target_rpc,
                     fallback_rpc_url=target_fallback,
+                    sequencer_url=chain_info.get("sequencer_url", ""),
                     timeout_seconds=self.chain.timeout_seconds,
                 )
                 should_close_active_chain = True
@@ -425,7 +426,15 @@ class MintEngine:
 
             # 5. High-Precision Countdown to T-0 with RPC & GraphQL Pre-Warmup & Lead Offset Compensation
             if target_start_ts > time.time():
-                lead_seconds = max(self.config.broadcast_lead_ms / 1000.0, 0.12)
+                if wallets_needing_t0:
+                    # When live allowlist calldata is needed from OpenSea at T-0:
+                    # Firing early causes OpenSea to reject with DropStageNotStartedError and triggers retry loops.
+                    # Firing 5ms before T-0 ensures the packet arrives at OpenSea's server right as the stage activates,
+                    # returning calldata on Attempt 1 in ~100-120ms with 0 retries!
+                    lead_seconds = min(max(self.config.broadcast_lead_ms / 1000.0, 0.0), 0.005)
+                else:
+                    # For pre-signed transactions, lead by configured broadcast lead (e.g. 80ms) to hit mempool on block open
+                    lead_seconds = max(self.config.broadcast_lead_ms / 1000.0, 0.05)
                 target_broadcast_time = target_start_ts - lead_seconds
 
                 rem = target_broadcast_time - time.time()
@@ -484,7 +493,7 @@ class MintEngine:
                     rem_final = target_broadcast_time - time.time()
                     if rem_final <= 0:
                         break
-                    await asyncio.sleep(min(0.05, rem_final))
+                    await asyncio.sleep(min(0.01, max(0.001, rem_final - 0.002)))
 
             if self._cancel_requested:
                 await notify("❌ Minting was cancelled by user before broadcast.")
@@ -610,7 +619,7 @@ class MintEngine:
                     return
                 t0 = time.time()
                 try:
-                    rec = await active_chain.wait_for_receipt(r.tx_hash, timeout_seconds=30.0)
+                    rec = await active_chain.wait_for_receipt(r.tx_hash, timeout_seconds=30.0, poll_interval=0.15)
                     r.confirm_time_seconds = round(time.time() - t0, 2)
                     r.total_time_seconds = round(time.time() - broadcast_start, 2)
                     if rec and not isinstance(rec, Exception):

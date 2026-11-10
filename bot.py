@@ -22,7 +22,11 @@ class TelegramBot:
     def __init__(self, config: AppConfig, wallet_mgr: WalletManager) -> None:
         self.config = config
         self.wallets = wallet_mgr
-        self.chain = ChainClient(config.rpc_url, config.fallback_rpc_url)
+        self.chain = ChainClient(
+            config.rpc_url,
+            config.fallback_rpc_url,
+            sequencer_url=getattr(config, "robinhood_sequencer_url", "https://sequencer.mainnet.chain.robinhood.com"),
+        )
         self.opensea = OpenSeaClient(
             timeout_seconds=config.opensea_timeout_ms / 1000.0,
             api_key=getattr(config, "opensea_api_key", ""),
@@ -195,7 +199,7 @@ class TelegramBot:
                 f"❌ <b>Failed to load drop:</b> {e}\n\nPlease check the URL or contract address.",
             )
 
-    async def render_mint_card(self, chat_id: int, message_id: int) -> None:
+    async def render_mint_card(self, chat_id: int, message_id: int, force_refresh_eligibility: bool = False) -> None:
         session = self._card_sessions.get(message_id) or self._active_sessions.get(chat_id)
         if not session:
             return
@@ -229,15 +233,21 @@ class TelegramBot:
         eth_usd_rate = await get_eth_usd_rate()
 
         # Check eligibility upfront for private/allowlist stages
+        if force_refresh_eligibility:
+            session.pop("eligibility_cache", None)
+            self.opensea.clear_eligibility_cache(coll.slug)
+
         eligibility_cache = session.setdefault("eligibility_cache", {})
 
         # Concurrently pre-fetch eligibility for all uncached wallets in parallel (populates all stages!)
         if not stage.is_public:
-            uncached = [w for w in all_configured_wallets if (stage.uuid, w.address) not in eligibility_cache]
+            uncached = [w for w in all_configured_wallets if (stage.uuid, w.address) not in eligibility_cache or force_refresh_eligibility]
             if uncached:
                 async def fetch_one(w: WalletAccount):
                     try:
-                        all_stage_map = await self.opensea.check_wallet_eligibility_all_stages(coll, w)
+                        all_stage_map = await self.opensea.check_wallet_eligibility_all_stages(
+                            coll, w, force_refresh=force_refresh_eligibility, chain_client=self.chain
+                        )
                         for s_uuid, el in all_stage_map.items():
                             eligibility_cache[(s_uuid, w.address)] = el
                         # Also sync any cross-populated wallets from OpenSea's response into session eligibility_cache!
@@ -252,12 +262,14 @@ class TelegramBot:
 
                 await asyncio.gather(*(fetch_one(w) for w in uncached))
 
-        # Automatically select ONLY eligible wallets on stage load or when switching stages
-        if session.get("auto_filtered_stage") != stage.uuid:
+        # Automatically select ONLY eligible wallets with remaining allocation (> 0) on stage load or when switching stages
+        if session.get("auto_filtered_stage") != stage.uuid or force_refresh_eligibility:
             if not stage.is_public:
                 eligible_wallets = [
                     w for w in all_configured_wallets
-                    if eligibility_cache.get((stage.uuid, w.address)) and eligibility_cache[(stage.uuid, w.address)].is_eligible
+                    if eligibility_cache.get((stage.uuid, w.address))
+                    and eligibility_cache[(stage.uuid, w.address)].is_eligible
+                    and eligibility_cache[(stage.uuid, w.address)].max_mintable > 0
                 ]
                 session["selected_wallets"] = eligible_wallets
                 wallets = eligible_wallets
@@ -446,29 +458,29 @@ class TelegramBot:
                 cache_key = (stage.uuid, w.address)
                 elig = session.get("eligibility_cache", {}).get(cache_key)
                 if not elig or not elig.is_eligible:
-                    elig = await self.opensea.check_wallet_eligibility(coll, stage, w)
+                    elig = await self.opensea.check_wallet_eligibility(coll, stage, w, force_refresh=True, chain_client=self.chain)
                     session.setdefault("eligibility_cache", {})[cache_key] = elig
                 wallet_eligs[w.address] = elig
-                if elig.is_eligible:
+                if elig.is_eligible and elig.max_mintable > 0:
                     valid_wallets.append(w)
                 else:
-                    ineligible_wallets.append((w, elig.reason))
+                    ineligible_wallets.append((w, elig.reason or "Allocation limit reached"))
 
             if not valid_wallets:
                 inelig_details = "\n".join(f"• <b>{w.label}</b> ({w.short_address}): <i>{r}</i>" for w, r in ineligible_wallets)
                 await self.send_message(
                     chat_id,
                     f"❌ <b>Eligibility Check Failed!</b>\n\n"
-                    f"None of your selected wallet(s) are eligible for <b>{stage.label}</b>:\n{inelig_details}\n\n"
+                    f"None of your selected wallet(s) have remaining allocation for <b>{stage.label}</b>:\n{inelig_details}\n\n"
                     f"💡 <i>Tip: Select an eligible wallet or switch to Public stage!</i>",
                 )
                 return
 
             if ineligible_wallets:
-                inelig_msg = ", ".join(f"<b>{w.label}</b>" for w, _ in ineligible_wallets)
+                inelig_msg = ", ".join(f"<b>{w.label}</b> (<i>{r}</i>)" for w, r in ineligible_wallets)
                 await self.send_message(
                     chat_id,
-                    f"⚠️ <b>Notice:</b> {inelig_msg} is not on the Allowlist for {stage.label} and was removed.\n"
+                    f"⚠️ <b>Notice:</b> {inelig_msg} was removed from {stage.label} (no remaining allocation).\n"
                     f"Proceeding with {len(valid_wallets)} eligible wallet(s).",
                 )
                 wallets = valid_wallets
@@ -587,6 +599,11 @@ class TelegramBot:
             self._active_mints.pop(job_id, None)
             if self._active_mint_tasks.get(chat_id) == current_task:
                 self._active_mint_tasks.pop(chat_id, None)
+            # Clear eligibility cache for this collection so future stages or re-mints check fresh on-chain allocations!
+            self.opensea.clear_eligibility_cache(coll.slug)
+            if session:
+                session.pop("eligibility_cache", None)
+                session.pop("auto_filtered_stage", None)
 
         if any(r.status.startswith("CANCELLED") for r in results):
             first_cancelled = next(r for r in results if r.status.startswith("CANCELLED"))
@@ -879,7 +896,10 @@ class TelegramBot:
                     session["expected_price_wei"] = new_stage.price_wei
                     session["expected_price_unit"] = new_stage.price_unit
                     session["expected_price_symbol"] = new_stage.price_symbol
-                    await self.render_mint_card(chat_id, msg_id)
+                    session.pop("eligibility_cache", None)
+                    session.pop("auto_filtered_stage", None)
+                    self.opensea.clear_eligibility_cache(coll.slug)
+                    await self.render_mint_card(chat_id, msg_id, force_refresh_eligibility=True)
         elif data == "qty_inc":
             if session:
                 session["quantity"] = min(session["quantity"] + 1, 50)
@@ -898,6 +918,13 @@ class TelegramBot:
                     if any(w.address == target_w.address for w in curr_sel):
                         session["selected_wallets"] = [w for w in curr_sel if w.address != target_w.address]
                     else:
+                        stage = session.get("selected_stage")
+                        if stage and not stage.is_public:
+                            cache_key = (stage.uuid, target_w.address)
+                            el = session.get("eligibility_cache", {}).get(cache_key)
+                            if el and (not el.is_eligible or el.max_mintable == 0):
+                                await self.answer_callback(cb_id, text=f"⚠️ {target_w.label}: {el.reason or 'No remaining allocation'}", show_alert=True)
+                                return
                         session["selected_wallets"].append(target_w)
                     await self.render_mint_card(chat_id, msg_id)
         elif data == "wallet_select_all":
@@ -908,7 +935,9 @@ class TelegramBot:
                     elig_cache = session.get("eligibility_cache", {})
                     elig_w = [
                         w for w in all_w
-                        if elig_cache.get((stage.uuid, w.address)) and elig_cache[(stage.uuid, w.address)].is_eligible
+                        if elig_cache.get((stage.uuid, w.address))
+                        and elig_cache[(stage.uuid, w.address)].is_eligible
+                        and elig_cache[(stage.uuid, w.address)].max_mintable > 0
                     ]
                     session["selected_wallets"] = elig_w if elig_w else list(all_w)
                 else:

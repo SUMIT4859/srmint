@@ -17,6 +17,7 @@ class AppConfig:
     telegram_admin_id: int = 0
     rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
     fallback_rpc_url: str = "https://rpc.mainnet.chain.robinhood.com"
+    robinhood_sequencer_url: str = "https://sequencer.mainnet.chain.robinhood.com"
     ink_rpc_url: str = "https://rpc-gel.inkonchain.com"
     ink_fallback_rpc_url: str = "https://rpc-qnd.inkonchain.com"
     eth_rpc_url: str = "https://ethereum-rpc.publicnode.com"
@@ -77,6 +78,7 @@ class AppConfig:
 
         cfg.rpc_url = os.getenv("RPC_URL", cfg.rpc_url)
         cfg.fallback_rpc_url = os.getenv("FALLBACK_RPC_URL", cfg.fallback_rpc_url)
+        cfg.robinhood_sequencer_url = os.getenv("ROBINHOOD_SEQUENCER_URL", cfg.robinhood_sequencer_url)
         cfg.ink_rpc_url = os.getenv("INK_RPC_URL", cfg.ink_rpc_url)
         cfg.ink_fallback_rpc_url = os.getenv("INK_FALLBACK_RPC_URL", cfg.ink_fallback_rpc_url)
         cfg.eth_rpc_url = os.getenv("ETH_RPC_URL", cfg.eth_rpc_url)

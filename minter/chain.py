@@ -28,9 +28,16 @@ class TransactionReceipt:
 
 
 class ChainClient:
-    def __init__(self, rpc_url: str, fallback_rpc_url: str = "", timeout_seconds: float = 8.0) -> None:
+    def __init__(
+        self,
+        rpc_url: str,
+        fallback_rpc_url: str = "",
+        sequencer_url: str = "",
+        timeout_seconds: float = 8.0,
+    ) -> None:
         self.rpc_url = rpc_url
         self.fallback_rpc_url = fallback_rpc_url
+        self.sequencer_url = sequencer_url
         self.timeout_seconds = timeout_seconds
         self._client: httpx.AsyncClient | None = None
         self._chain_id: int | None = None
@@ -186,9 +193,14 @@ class ChainClient:
     async def broadcast_raw_transaction(self, raw_tx: bytes) -> str:
         hex_data = f"0x{raw_tx.hex()}"
 
-        # If fallback RPC is available, race BOTH endpoints in parallel (Hedged Dual-RPC Broadcast)
-        # to ensure zero delays from single-endpoint lag, mempool queuing, or rate-limits!
-        if self.fallback_rpc_url and self.fallback_rpc_url != self.rpc_url:
+        # Collect distinct broadcast endpoints (primary RPC, direct sequencer, and fallback RPC)
+        # Racing all available endpoints simultaneously ensures the fastest node or sequencer queue wins!
+        endpoints = []
+        for u in [self.rpc_url, self.sequencer_url, self.fallback_rpc_url]:
+            if u and u not in endpoints:
+                endpoints.append(u)
+
+        if len(endpoints) > 1:
             async def send_to(endpoint_url: str) -> str:
                 payload = {
                     "jsonrpc": "2.0",
@@ -212,17 +224,14 @@ class ChainClient:
                     raise RuntimeError(f"Empty result from {endpoint_url}")
                 return res
 
-            tasks = [
-                asyncio.create_task(send_to(self.rpc_url)),
-                asyncio.create_task(send_to(self.fallback_rpc_url)),
-            ]
+            tasks = [asyncio.create_task(send_to(u)) for u in endpoints]
 
             errors: list[Exception] = []
             for fut in asyncio.as_completed(tasks):
                 try:
                     res = await fut
                     if res:
-                        # Cancel slower endpoint immediately
+                        # Cancel slower endpoints immediately
                         for t in tasks:
                             if not t.done():
                                 t.cancel()
@@ -260,7 +269,7 @@ class ChainClient:
         self,
         tx_hash: str,
         timeout_seconds: float = 30.0,
-        poll_interval: float = 0.5,
+        poll_interval: float = 0.15,
     ) -> TransactionReceipt | None:
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:

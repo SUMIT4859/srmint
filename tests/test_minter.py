@@ -668,7 +668,11 @@ def test_hedged_broadcast_dual_rpc():
     from minter.chain import ChainClient
 
     async def run_test():
-        client = ChainClient("https://primary-rpc.com", fallback_rpc_url="https://fallback-rpc.com")
+        client = ChainClient(
+            "https://primary-rpc.com",
+            fallback_rpc_url="https://fallback-rpc.com",
+            sequencer_url="https://sequencer.mainnet.chain.robinhood.com",
+        )
         
         # Mock httpx client
         mock_http = AsyncMock()
@@ -680,18 +684,22 @@ def test_hedged_broadcast_dual_rpc():
                 # Primary RPC is slow (simulating 2s lag/hang)
                 await asyncio.sleep(0.5)
                 resp.json = lambda: {"result": "0xprimary"}
+            elif url == "https://sequencer.mainnet.chain.robinhood.com":
+                # Direct Sequencer responds ultra-fast in 5ms!
+                await asyncio.sleep(0.005)
+                resp.json = lambda: {"result": "0xfast_sequencer"}
             else:
-                # Fallback RPC responds instantly in 10ms!
-                await asyncio.sleep(0.01)
-                resp.json = lambda: {"result": "0xfast_fallback"}
+                # Fallback RPC responds in 100ms
+                await asyncio.sleep(0.1)
+                resp.json = lambda: {"result": "0xfallback"}
             return resp
 
         mock_http.post = mock_post
         client.get_client = AsyncMock(return_value=mock_http)
 
-        # Broadcast should take ~0.01s, winning with the fallback RPC result
+        # Broadcast should take ~0.005s, winning with the direct sequencer result!
         tx_hash = await client.broadcast_raw_transaction(b"\x02\x01\x02")
-        assert tx_hash == "0xfast_fallback"
+        assert tx_hash == "0xfast_sequencer"
 
     asyncio.run(run_test())
 
@@ -1059,6 +1067,7 @@ def test_auto_select_eligible_wallets_only():
 
     w1 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001", label="EligibleWallet")
     w2 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000002", label="IneligibleWallet")
+    w3 = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000003", label="MaxMintedWallet")
 
     stage_private = DropStage(
         uuid="stage-allowlist-1",
@@ -1078,18 +1087,164 @@ def test_auto_select_eligible_wallets_only():
     eligibility_cache = {
         (stage_private.uuid, w1.address): WalletEligibility(is_eligible=True, max_mintable=1, price_wei=0),
         (stage_private.uuid, w2.address): WalletEligibility(is_eligible=False, reason="Not on Allowlist"),
+        (stage_private.uuid, w3.address): WalletEligibility(is_eligible=False, max_mintable=0, reason="Already minted maximum allocation (1/1)"),
     }
 
-    all_wallets = [w1, w2]
-    # Verify auto-filter selects ONLY eligible wallet
+    all_wallets = [w1, w2, w3]
+    # Verify auto-filter selects ONLY eligible wallet with remaining allocation (> 0)
     selected = [
         w for w in all_wallets
-        if eligibility_cache.get((stage_private.uuid, w.address)) and eligibility_cache[(stage_private.uuid, w.address)].is_eligible
+        if eligibility_cache.get((stage_private.uuid, w.address))
+        and eligibility_cache[(stage_private.uuid, w.address)].is_eligible
+        and eligibility_cache[(stage_private.uuid, w.address)].max_mintable > 0
     ]
 
     assert len(selected) == 1
     assert selected[0].address == w1.address
     assert w2 not in selected
+    assert w3 not in selected
+
+
+def test_multiphase_allocation_tracking_and_onchain_balance():
+    """Verify that when a wallet has already minted its allocation in GTD or on-chain,
+    it is detected as 0 left and marked not eligible for the next phase (FCFS)."""
+    from minter.client import CollectionInfo, DropStage, OpenSeaClient
+    from minter.wallet import WalletAccount
+
+    async def run_test():
+        os_client = OpenSeaClient(timeout_seconds=5.0)
+
+        w_gtd_minted = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001", label="SECOND")
+        w_remaining = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000002", label="new")
+
+        stage_fcfs = DropStage(
+            uuid="fcfs-uuid-123",
+            label="FCFS",
+            stage_type="SIGNED_PRESALE",
+            stage_index=1,
+            start_time="now",
+            end_time="later",
+            start_timestamp=100,
+            end_timestamp=500,
+            max_per_wallet=1,
+            price_wei=0,
+            price_symbol="ETH",
+            price_unit=0.0,
+        )
+
+        coll = CollectionInfo(
+            name="Test Drop",
+            slug="test-drop",
+            contract_address="0x" + "9" * 40,
+            image_url="",
+            chain_identifier="robinhood",
+            chain_id=4663,
+            total_supply=100,
+            max_supply=1000,
+            stages=[stage_fcfs],
+        )
+
+        # Mock OpenSea GraphQL response where w_gtd_minted already has quantityMinted: 1, maxTotalMintableByWallet: 1
+        mock_response_data = {
+            "data": {
+                "dropBySlug": {
+                    "stages": [{"uuid": "fcfs-uuid-123", "eligibleMaxTotalMintableByWallet": 1, "isEligible": True}],
+                    "accountStageEligibility": {
+                        "wallets": [
+                            {
+                                "address": w_gtd_minted.address,
+                                "quantityMinted": 1,
+                                "stages": [
+                                    {
+                                        "dropStageUuid": "fcfs-uuid-123",
+                                        "isEligible": True,
+                                        "maxTotalMintableByWallet": 1,
+                                    }
+                                ],
+                            },
+                            {
+                                "address": w_remaining.address,
+                                "quantityMinted": 0,
+                                "stages": [
+                                    {
+                                        "dropStageUuid": "fcfs-uuid-123",
+                                        "isEligible": True,
+                                        "maxTotalMintableByWallet": 2,
+                                    }
+                                ],
+                            },
+                        ]
+                    },
+                }
+            }
+        }
+
+        mock_http = MagicMock()
+        mock_http.is_closed = False
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = mock_response_data
+        mock_http.post = AsyncMock(return_value=mock_resp)
+
+        os_client._wallet_clients[w_gtd_minted.address.lower()] = mock_http
+        os_client._wallet_clients[w_remaining.address.lower()] = mock_http
+        os_client.authenticate_wallet = AsyncMock()
+
+        # Query eligibility
+        eligs_second = await os_client.check_wallet_eligibility_all_stages(coll, w_gtd_minted)
+        el_second = eligs_second["fcfs-uuid-123"]
+
+        # SECOND has minted 1/1 -> remaining 0 -> is_eligible must be False!
+        assert el_second.is_eligible is False
+        assert el_second.max_mintable == 0
+        assert "Already minted maximum allocation" in el_second.reason
+
+        # new has minted 0/2 -> remaining 2 -> is_eligible must be True!
+        eligs_new = await os_client.check_wallet_eligibility_all_stages(coll, w_remaining)
+        el_new = eligs_new["fcfs-uuid-123"]
+        assert el_new.is_eligible is True
+        assert el_new.max_mintable == 2
+        assert "2 Left" in el_new.reason
+
+        # Now test on-chain balance detection override
+        mock_chain = MagicMock()
+        # Mock balanceOf returns 1 token (hex 0x01 padded)
+        mock_chain.call = AsyncMock(return_value="0x" + "0" * 63 + "1")
+
+        # Even if OpenSea reported 0 quantityMinted, on-chain ground truth balance = 1
+        mock_response_zero_os = {
+            "data": {
+                "dropBySlug": {
+                    "accountStageEligibility": {
+                        "wallets": [
+                            {
+                                "address": w_gtd_minted.address,
+                                "quantityMinted": 0,
+                                "stages": [
+                                    {
+                                        "dropStageUuid": "fcfs-uuid-123",
+                                        "isEligible": True,
+                                        "maxTotalMintableByWallet": 1,
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        mock_resp.json.return_value = mock_response_zero_os
+        os_client.clear_eligibility_cache(coll.slug)
+
+        eligs_onchain = await os_client.check_wallet_eligibility_all_stages(
+            coll, w_gtd_minted, force_refresh=True, chain_client=mock_chain
+        )
+        el_onchain = eligs_onchain["fcfs-uuid-123"]
+        assert el_onchain.is_eligible is False
+        assert el_onchain.max_mintable == 0
+        assert "Already minted maximum allocation (1/1)" in el_onchain.reason
+
+    asyncio.run(run_test())
 
 
 def test_active_scheduled_mint_cancellation():
@@ -1380,6 +1535,7 @@ if __name__ == "__main__":
     test_siwe_statement_and_headers()
     test_cross_wallet_eligibility_caching()
     test_auto_select_eligible_wallets_only()
+    test_multiphase_allocation_tracking_and_onchain_balance()
     test_active_scheduled_mint_cancellation()
     test_concurrent_multi_mint_nonce_reservation()
     test_simultaneous_multi_drop_selective_cancellation()

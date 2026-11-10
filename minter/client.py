@@ -315,6 +315,15 @@ class OpenSeaClient:
                 await cl.aclose()
         self._wallet_clients.clear()
 
+    def clear_eligibility_cache(self, slug: str | None = None) -> None:
+        """Clear cached stage eligibility so subsequent stages query fresh real-time minted counts."""
+        if slug:
+            self._wallet_stage_elig_cache = {
+                k: v for k, v in self._wallet_stage_elig_cache.items() if k[0] != slug
+            }
+        else:
+            self._wallet_stage_elig_cache.clear()
+
     def start_heartbeat(self, slug: str, wallets: list[WalletAccount], interval_seconds: int = 25) -> None:
         """Start background session keepalive to prevent timeouts during long waits."""
         self.stop_heartbeat(slug)
@@ -803,27 +812,43 @@ class OpenSeaClient:
         self,
         collection: CollectionInfo,
         wallet: WalletAccount,
+        force_refresh: bool = False,
+        chain_client: Any = None,
     ) -> dict[str, WalletEligibility]:
         """
         Verify wallet eligibility across ALL drop stages in a single query.
         Returns a dict mapping stage.uuid -> WalletEligibility.
         """
         cache_key = (collection.slug, wallet.address.lower())
-        if cache_key in self._wallet_stage_elig_cache:
+        if not force_refresh and cache_key in self._wallet_stage_elig_cache:
             return self._wallet_stage_elig_cache[cache_key]
 
         results: dict[str, WalletEligibility] = {}
 
+        # Check on-chain ground truth balance for this wallet on this collection contract
+        on_chain_balance = 0
+        if chain_client and getattr(collection, "contract_address", ""):
+            try:
+                addr_padded = wallet.address[2:].lower().rjust(64, "0")
+                call_data = "0x70a08231" + addr_padded
+                bal_hex = await chain_client.call(collection.contract_address, call_data)
+                if bal_hex and bal_hex != "0x":
+                    on_chain_balance = int(bal_hex, 16)
+            except Exception:
+                on_chain_balance = 0
+
         # 1. Pre-fill any public stages
         for st in collection.stages:
             if st.is_public:
+                max_w = st.max_per_wallet or 1
+                rem = max(0, max_w - on_chain_balance) if on_chain_balance > 0 else max_w
                 results[st.uuid] = WalletEligibility(
-                    is_eligible=True,
+                    is_eligible=(rem > 0),
                     price_wei=st.price_wei,
                     price_unit=st.price_unit,
                     price_symbol=st.price_symbol,
-                    reason="Eligible (Public Sale)",
-                    max_mintable=st.max_per_wallet or 1,
+                    reason=f"Eligible ({rem} Left)" if rem > 0 else f"Already minted maximum allocation ({on_chain_balance}/{max_w})",
+                    max_mintable=rem,
                 )
 
         # Ensure wallet has an active SIWE session (cached, runs at most once per session)
@@ -854,6 +879,7 @@ class OpenSeaClient:
                 account_elig = d.get("accountStageEligibility") or {}
                 wallets_list = account_elig.get("wallets") or []
                 stages_list = d.get("stages") or []
+                minter_qty_minted = int(d.get("minterQuantityMinted") or 0)
 
                 # Build fallback price mapping per stage uuid or index
                 top_stage_prices: dict[str, tuple[float, str, int]] = {}
@@ -869,18 +895,23 @@ class OpenSeaClient:
                 # Process and cross-populate cache for ALL wallets returned by OpenSea in this query!
                 for w_info in wallets_list:
                     w_addr_lower = w_info.get("address", "").lower()
-                    w_qty_minted = int(w_info.get("quantityMinted") or 0)
+                    w_qty_minted = max(int(w_info.get("quantityMinted") or 0), minter_qty_minted)
+                    if w_addr_lower == wallet.address.lower() and on_chain_balance > 0:
+                        w_qty_minted = max(w_qty_minted, on_chain_balance)
+
                     w_stage_results: dict[str, WalletEligibility] = {}
 
                     for st in collection.stages:
                         if st.is_public:
+                            max_w = st.max_per_wallet or 1
+                            rem = max(0, max_w - w_qty_minted) if w_qty_minted > 0 else max_w
                             w_stage_results[st.uuid] = WalletEligibility(
-                                is_eligible=True,
+                                is_eligible=(rem > 0),
                                 price_wei=st.price_wei,
                                 price_unit=st.price_unit,
                                 price_symbol=st.price_symbol,
-                                reason="Eligible (Public Sale)",
-                                max_mintable=st.max_per_wallet or 1,
+                                reason=f"Eligible ({rem} Left)" if rem > 0 else f"Already minted maximum allocation ({w_qty_minted}/{max_w})",
+                                max_mintable=rem,
                             )
 
                     for st_info in w_info.get("stages", []):
@@ -903,13 +934,13 @@ class OpenSeaClient:
                         remaining_mintable = max(0, max_total_int - w_qty_minted)
 
                         if st_info.get("isEligible") is True:
-                            if remaining_mintable == 0:
+                            if remaining_mintable <= 0:
                                 w_stage_results[u] = WalletEligibility(
                                     is_eligible=False,
                                     price_wei=0,
                                     price_unit=0.0,
                                     price_symbol="ETH",
-                                    reason="Already minted maximum allocation",
+                                    reason=f"Already minted maximum allocation ({w_qty_minted}/{max_total_int})",
                                     max_mintable=0,
                                 )
                                 continue
@@ -926,8 +957,8 @@ class OpenSeaClient:
                                 price_wei=p_wei,
                                 price_unit=p_unit,
                                 price_symbol=p_sym,
-                                reason="Eligible (Allowlist Verified)",
-                                max_mintable=max(1, remaining_mintable),
+                                reason=f"Eligible ({remaining_mintable} Left)",
+                                max_mintable=remaining_mintable,
                             )
                         elif st_info.get("isEligible") is False:
                             w_stage_results[u] = WalletEligibility(
@@ -964,8 +995,22 @@ class OpenSeaClient:
                         fb_unit = matching_stage.price_unit if matching_stage else 0.0
                         fb_sym = matching_stage.price_symbol if matching_stage else "ETH"
                         fb_wei = matching_stage.price_wei if matching_stage else 0
+                        top_max = st.get("eligibleMaxTotalMintableByWallet") or st.get("maxTotalMintableByWallet") or (matching_stage.max_per_wallet if matching_stage else 1)
+                        top_max_int = int(top_max or 1)
+                        rem = max(0, top_max_int - on_chain_balance) if on_chain_balance > 0 else top_max_int
 
                         if (not el_minter or el_minter == wallet.address.lower()) and st.get("isEligible") is True:
+                            if rem <= 0:
+                                results[u] = WalletEligibility(
+                                    is_eligible=False,
+                                    price_wei=0,
+                                    price_unit=0.0,
+                                    price_symbol="ETH",
+                                    reason=f"Already minted maximum allocation ({on_chain_balance}/{top_max_int})",
+                                    max_mintable=0,
+                                )
+                                continue
+
                             el_p = (st.get("eligiblePrice") or {}).get("token") or {}
                             if el_p.get("unit") is not None:
                                 p_unit = float(el_p.get("unit") or 0.0)
@@ -978,9 +1023,21 @@ class OpenSeaClient:
                                 price_wei=p_wei,
                                 price_unit=p_unit,
                                 price_symbol=p_sym,
-                                reason="Eligible (Allowlist Verified)",
+                                reason=f"Eligible ({rem} Left)",
+                                max_mintable=rem,
                             )
                         elif not el_minter and st.get("isEligible") is True and not wallets_list:
+                            if rem <= 0:
+                                results[u] = WalletEligibility(
+                                    is_eligible=False,
+                                    price_wei=0,
+                                    price_unit=0.0,
+                                    price_symbol="ETH",
+                                    reason=f"Already minted maximum allocation ({on_chain_balance}/{top_max_int})",
+                                    max_mintable=0,
+                                )
+                                continue
+
                             el_p = (st.get("eligiblePrice") or {}).get("token") or {}
                             if el_p.get("unit") is not None:
                                 p_unit = float(el_p.get("unit") or 0.0)
@@ -993,7 +1050,8 @@ class OpenSeaClient:
                                 price_wei=p_wei,
                                 price_unit=p_unit,
                                 price_symbol=p_sym,
-                                reason="Eligible (Allowlist Verified)",
+                                reason=f"Eligible ({rem} Left)",
+                                max_mintable=rem,
                             )
         except Exception:
             pass
@@ -1017,6 +1075,8 @@ class OpenSeaClient:
         collection: CollectionInfo,
         stage: DropStage,
         wallet: WalletAccount,
+        force_refresh: bool = False,
+        chain_client: Any = None,
     ) -> WalletEligibility:
         """
         Verify if a wallet is eligible to mint in the given drop stage,
@@ -1024,16 +1084,30 @@ class OpenSeaClient:
         Returns WalletEligibility.
         """
         if stage.is_public:
+            on_chain_balance = 0
+            if chain_client and getattr(collection, "contract_address", ""):
+                try:
+                    addr_padded = wallet.address[2:].lower().rjust(64, "0")
+                    call_data = "0x70a08231" + addr_padded
+                    bal_hex = await chain_client.call(collection.contract_address, call_data)
+                    if bal_hex and bal_hex != "0x":
+                        on_chain_balance = int(bal_hex, 16)
+                except Exception:
+                    on_chain_balance = 0
+            max_w = stage.max_per_wallet or 1
+            rem = max(0, max_w - on_chain_balance) if on_chain_balance > 0 else max_w
             return WalletEligibility(
-                is_eligible=True,
+                is_eligible=(rem > 0),
                 price_wei=stage.price_wei,
                 price_unit=stage.price_unit,
                 price_symbol=stage.price_symbol,
-                reason="Eligible (Public Sale)",
-                max_mintable=stage.max_per_wallet or 1,
+                reason=f"Eligible ({rem} Left)" if rem > 0 else f"Already minted maximum allocation ({on_chain_balance}/{max_w})",
+                max_mintable=rem,
             )
 
-        all_eligs = await self.check_wallet_eligibility_all_stages(collection, wallet)
+        all_eligs = await self.check_wallet_eligibility_all_stages(
+            collection, wallet, force_refresh=force_refresh, chain_client=chain_client
+        )
         if stage.uuid in all_eligs:
             return all_eligs[stage.uuid]
 
