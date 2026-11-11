@@ -88,7 +88,6 @@ CHAINS = {
         "explorer": "https://robin.etherscan.io",
         "default_rpc": "https://rpc.mainnet.chain.robinhood.com",
         "fallback_rpc": "https://rpc.mainnet.chain.robinhood.com",
-        "sequencer_url": "https://sequencer.mainnet.chain.robinhood.com",
         "fee_recipient": OPENSEA_FEE_RECIPIENT,
     },
     57073: {

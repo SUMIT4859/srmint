@@ -664,7 +664,7 @@ def test_elysium_chain_support():
 
 def test_hedged_broadcast_dual_rpc():
     import asyncio
-    from unittest.mock import AsyncMock, patch
+    from unittest.mock import AsyncMock
     from minter.chain import ChainClient
 
     async def run_test():
@@ -674,32 +674,30 @@ def test_hedged_broadcast_dual_rpc():
             sequencer_url="https://sequencer.mainnet.chain.robinhood.com",
         )
         
-        # Mock httpx client
+        called_urls = []
         mock_http = AsyncMock()
         
         async def mock_post(url, json=None, headers=None):
+            called_urls.append(url)
             resp = AsyncMock()
             resp.raise_for_status = lambda: None
             if url == "https://primary-rpc.com":
-                # Primary RPC is slow (simulating 2s lag/hang)
+                # Primary RPC is slow (simulating lag)
                 await asyncio.sleep(0.5)
                 resp.json = lambda: {"result": "0xprimary"}
-            elif url == "https://sequencer.mainnet.chain.robinhood.com":
-                # Direct Sequencer responds ultra-fast in 5ms!
-                await asyncio.sleep(0.005)
-                resp.json = lambda: {"result": "0xfast_sequencer"}
             else:
-                # Fallback RPC responds in 100ms
-                await asyncio.sleep(0.1)
+                # Fallback RPC responds ultra-fast in 5ms!
+                await asyncio.sleep(0.005)
                 resp.json = lambda: {"result": "0xfallback"}
             return resp
 
         mock_http.post = mock_post
         client.get_client = AsyncMock(return_value=mock_http)
 
-        # Broadcast should take ~0.005s, winning with the direct sequencer result!
+        # Broadcast should only race Primary + Fallback RPC (never sequencer_url) and take ~0.005s!
         tx_hash = await client.broadcast_raw_transaction(b"\x02\x01\x02")
-        assert tx_hash == "0xfast_sequencer"
+        assert tx_hash == "0xfallback"
+        assert "https://sequencer.mainnet.chain.robinhood.com" not in called_urls
 
     asyncio.run(run_test())
 
@@ -1508,34 +1506,24 @@ def test_telegram_bot_multi_drop_card_isolation():
         assert bot._card_sessions[200]["collection"].slug == "collb"
 
 
-def test_sequencer_prioritization_and_allocation_retry():
-    from minter.chain import ChainClient
-    cc = ChainClient(
-        rpc_url="https://rpc1.com",
-        fallback_rpc_url="https://rpc2.com",
-        sequencer_url="https://sequencer.robinhood.com",
-    )
-    endpoints = []
-    for u in [cc.sequencer_url, cc.rpc_url, cc.fallback_rpc_url]:
-        if u and u not in endpoints:
-            endpoints.append(u)
-    assert endpoints[0] == "https://sequencer.robinhood.com"
-    assert endpoints[1] == "https://rpc1.com"
-    assert endpoints[2] == "https://rpc2.com"
+def test_sequencer_excluded_from_chain_constants():
+    from minter.constants import get_chain_info
+    rb = get_chain_info(4663)
+    assert rb["name"] == "Robinhood Chain"
+    assert not rb.get("sequencer_url"), "Robinhood Chain should use clean Dual-RPC without sequencer_url"
 
 
-def test_micro_poll_receipt_and_dual_ingestion():
+def test_safe_poll_receipt_and_dual_rpc():
     import inspect
     from minter.chain import ChainClient
     cc = ChainClient(
         rpc_url="https://alchemy.rpc",
         fallback_rpc_url="https://fallback.rpc",
-        sequencer_url="https://sequencer.robinhood.com",
     )
     sig = inspect.signature(cc.wait_for_receipt)
-    assert sig.parameters["poll_interval"].default == 0.025, f"poll_interval should default to 0.025s (25ms), got {sig.parameters['poll_interval'].default}"
+    assert sig.parameters["poll_interval"].default == 0.15, f"poll_interval should default to safe 0.15s (150ms), got {sig.parameters['poll_interval'].default}"
 
-    # Verify receipt tracking resolves instantly with 25ms micro-polling
+    # Verify receipt tracking resolves instantly on Poll #1 with 0ms sleep
     async def run_wait_test():
         cc.rpc_request = AsyncMock(return_value={
             "status": "0x1",
@@ -1553,7 +1541,8 @@ def test_micro_poll_receipt_and_dual_ingestion():
 
 
 if __name__ == "__main__":
-    test_micro_poll_receipt_and_dual_ingestion()
+    test_sequencer_excluded_from_chain_constants()
+    test_safe_poll_receipt_and_dual_rpc()
     test_wallet_account()
     test_seadrop_encoding()
     test_opensea_slug_parser()
@@ -1585,7 +1574,6 @@ if __name__ == "__main__":
     test_concurrent_multi_mint_nonce_reservation()
     test_simultaneous_multi_drop_selective_cancellation()
     test_telegram_bot_multi_drop_card_isolation()
-    test_sequencer_prioritization_and_allocation_retry()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

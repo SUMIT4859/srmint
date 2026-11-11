@@ -193,10 +193,11 @@ class ChainClient:
     async def broadcast_raw_transaction(self, raw_tx: bytes) -> str:
         hex_data = f"0x{raw_tx.hex()}"
 
-        # Collect distinct broadcast endpoints (direct sequencer first, primary RPC, and fallback RPC)
-        # Racing all available endpoints simultaneously ensures the fastest node or sequencer queue wins!
+        # Race ONLY primary RPC and fallback RPC in parallel (Hedged Dual-RPC Broadcast).
+        # Avoid direct sequencer URL so RPC nodes handle pre-execution ordering cleanly and
+        # return confirmed receipts on Poll #1 without HTTP/2 contention!
         endpoints = []
-        for u in [self.sequencer_url, self.rpc_url, self.fallback_rpc_url]:
+        for u in [self.rpc_url, self.fallback_rpc_url]:
             if u and u not in endpoints:
                 endpoints.append(u)
 
@@ -233,9 +234,10 @@ class ChainClient:
                 try:
                     res = await fut
                     if res:
-                        # Return fastest endpoint immediately for minimum broadcast latency,
-                        # while allowing secondary endpoints (Alchemy + Sequencer) to complete delivery
-                        # in the background so both nodes have the transaction in local memory for instant receipts!
+                        # Cancel slower endpoint immediately to keep HTTP/2 sockets clean
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
                         return res
                 except Exception as ex:
                     errors.append(ex)
@@ -270,7 +272,7 @@ class ChainClient:
         self,
         tx_hash: str,
         timeout_seconds: float = 30.0,
-        poll_interval: float = 0.025,
+        poll_interval: float = 0.15,
     ) -> TransactionReceipt | None:
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
