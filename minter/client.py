@@ -785,7 +785,14 @@ class OpenSeaClient:
                             if current_q > 1:
                                 variables["toAssets"][0]["quantity"] = str(current_q - 1)
                                 continue
-                            raise RuntimeError("Allocation limit exceeded for this wallet")
+
+                            now_ts = time.time()
+                            is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
+                            if is_transition_window and attempt < 5 and not single_attempt:
+                                last_err = RuntimeError("Waiting for OpenSea stage allocation unlock...")
+                                await asyncio.sleep(0.025)
+                                continue
+                            raise RuntimeError("Stage supply pool exhausted / allocation limit reached on OpenSea")
                         else:
                             last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
             except Exception as e:
@@ -796,8 +803,9 @@ class OpenSeaClient:
                 now_ts = time.time()
                 is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
                 err_str = str(e).lower()
-                if "allocation limit exceeded" in err_str:
-                    raise e
+                if "supply pool exhausted" in err_str or "allocation limit reached" in err_str:
+                    if not is_transition_window or attempt >= 5:
+                        raise e
                 if not is_transition_window:
                     if "not on the allowlist" in err_str or "not eligible" in err_str:
                         raise e

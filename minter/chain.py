@@ -193,10 +193,10 @@ class ChainClient:
     async def broadcast_raw_transaction(self, raw_tx: bytes) -> str:
         hex_data = f"0x{raw_tx.hex()}"
 
-        # Collect distinct broadcast endpoints (primary RPC, direct sequencer, and fallback RPC)
+        # Collect distinct broadcast endpoints (direct sequencer first, primary RPC, and fallback RPC)
         # Racing all available endpoints simultaneously ensures the fastest node or sequencer queue wins!
         endpoints = []
-        for u in [self.rpc_url, self.sequencer_url, self.fallback_rpc_url]:
+        for u in [self.sequencer_url, self.rpc_url, self.fallback_rpc_url]:
             if u and u not in endpoints:
                 endpoints.append(u)
 
@@ -272,9 +272,13 @@ class ChainClient:
         poll_interval: float = 0.15,
     ) -> TransactionReceipt | None:
         start_time = time.time()
+        poll_count = 0
         while time.time() - start_time < timeout_seconds:
             try:
-                res = await self.rpc_request("eth_getTransactionReceipt", [tx_hash])
+                poll_count += 1
+                # If primary RPC is lagging behind fast ~100ms blocks, alternate every 3rd poll to fallback/sequencer node
+                use_fb = (poll_count % 3 == 0) and bool(self.fallback_rpc_url and self.fallback_rpc_url != self.rpc_url)
+                res = await self.rpc_request("eth_getTransactionReceipt", [tx_hash], use_fallback=use_fb)
                 if res and isinstance(res, dict) and res.get("blockNumber") is not None:
                     return TransactionReceipt(
                         transaction_hash=tx_hash,

@@ -633,10 +633,11 @@ class TelegramBot:
         if max_total_time > 0:
             max_calldata_ms = max((getattr(r, "calldata_time_ms", 0) for r in results), default=0)
             on_chain_str = f"On-chain: {max_confirm_time:.2f}s (avg: {avg_confirm_time:.2f}s)" if len(confirm_times) > 1 else f"On-chain: {max_confirm_time:.2f}s"
+            bcast_lbl = "Sequencer" if getattr(self.chain, "sequencer_url", None) or self.chain_id == 5462 else "RPC"
             if max_calldata_ms > 0:
-                breakdown = f"OpenSea: {max_calldata_ms}ms | RPC: {broadcast_ms}ms | {on_chain_str}"
+                breakdown = f"OpenSea: {max_calldata_ms}ms | {bcast_lbl}: {broadcast_ms}ms | {on_chain_str}"
             else:
-                breakdown = f"Direct SeaDrop (0ms OS) | RPC: {broadcast_ms}ms | {on_chain_str}"
+                breakdown = f"Direct SeaDrop (0ms OS) | {bcast_lbl}: {broadcast_ms}ms | {on_chain_str}"
             summary_lines.append(
                 f"⏱️ <b>Total Time Taken:</b> <b>{max_total_time:.2f}s</b> ({breakdown})\n"
             )

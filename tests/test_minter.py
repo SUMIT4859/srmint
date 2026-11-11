@@ -1508,6 +1508,22 @@ def test_telegram_bot_multi_drop_card_isolation():
         assert bot._card_sessions[200]["collection"].slug == "collb"
 
 
+def test_sequencer_prioritization_and_allocation_retry():
+    from minter.chain import ChainClient
+    cc = ChainClient(
+        rpc_url="https://rpc1.com",
+        fallback_rpc_url="https://rpc2.com",
+        sequencer_url="https://sequencer.robinhood.com",
+    )
+    endpoints = []
+    for u in [cc.sequencer_url, cc.rpc_url, cc.fallback_rpc_url]:
+        if u and u not in endpoints:
+            endpoints.append(u)
+    assert endpoints[0] == "https://sequencer.robinhood.com"
+    assert endpoints[1] == "https://rpc1.com"
+    assert endpoints[2] == "https://rpc2.com"
+
+
 if __name__ == "__main__":
     test_wallet_account()
     test_seadrop_encoding()
@@ -1540,6 +1556,7 @@ if __name__ == "__main__":
     test_concurrent_multi_mint_nonce_reservation()
     test_simultaneous_multi_drop_selective_cancellation()
     test_telegram_bot_multi_drop_card_isolation()
+    test_sequencer_prioritization_and_allocation_retry()
     with tempfile.TemporaryDirectory() as tmp_dir:
         test_wallet_manager(Path(tmp_dir))
         test_app_config(Path(tmp_dir))

@@ -382,10 +382,11 @@ class MintEngine:
 
                     elif isinstance(act_res, Exception):
                         err_msg = str(act_res)
-                        if "stage activation" in err_msg.lower() or "not active" in err_msg.lower():
-                            # Stage unlocks at T-0: queue for T-0 pipeline without spamming
+                        now_check = time.time()
+                        if target_start_ts > now_check:
+                            # Stage has not started yet! Any calldata lock/error at T-10s before start is expected (calldata will unlock at T-0)
                             wallets_needing_t0.append(w)
-                        elif "not on the allowlist" in err_msg.lower() or "not eligible" in err_msg.lower() or "allocation limit exceeded" in err_msg.lower():
+                        elif "not on the allowlist" in err_msg.lower() or "not eligible" in err_msg.lower():
                             r.status = "FAILED"
                             r.error_message = err_msg
                         else:
@@ -503,7 +504,7 @@ class MintEngine:
                 return results
 
             # 6. INSTANT PIPELINED BROADCAST (Zero synchronous network delay at T-0)
-            asyncio.create_task(notify("⚡ T-0: FIRING TRANSACTIONS TO RPC! 🚀"))
+            asyncio.create_task(notify("⚡ T-0: FIRING TO DIRECT SEQUENCER & RPC! 🚀"))
             broadcast_started = True
             broadcast_start = time.time()
 
@@ -604,11 +605,12 @@ class MintEngine:
             if broadcasted:
                 max_bcast_ms = max((r.broadcast_time_ms for r in broadcasted), default=0)
                 max_calldata_ms = max((r.calldata_time_ms for r in broadcasted), default=0)
+                bcast_target = "Sequencer" if getattr(active_chain, "sequencer_url", None) or chain_id == 5462 else "RPC"
                 if max_calldata_ms > 0:
                     total_dispatch_ms = max_calldata_ms + max_bcast_ms
-                    summary_time = f"<b>{total_dispatch_ms} ms</b> (OpenSea: {max_calldata_ms}ms | RPC: {max_bcast_ms}ms)"
+                    summary_time = f"<b>{total_dispatch_ms} ms</b> (OpenSea: {max_calldata_ms}ms | {bcast_target}: {max_bcast_ms}ms)"
                 else:
-                    summary_time = f"<b>{max_bcast_ms} ms</b>"
+                    summary_time = f"<b>{max_bcast_ms} ms</b> ({bcast_target}: {max_bcast_ms}ms)"
                 asyncio.create_task(
                     notify(f"✅ Dispatched {len(broadcasted)} transaction(s) in {summary_time}! Tracking receipts...")
                 )
