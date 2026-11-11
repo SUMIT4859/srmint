@@ -605,7 +605,7 @@ class MintEngine:
             if broadcasted:
                 max_bcast_ms = max((r.broadcast_time_ms for r in broadcasted), default=0)
                 max_calldata_ms = max((r.calldata_time_ms for r in broadcasted), default=0)
-                bcast_target = "Sequencer" if getattr(active_chain, "sequencer_url", None) or chain_id == 5462 else "RPC"
+                bcast_target = "Sequencer" if getattr(active_chain, "sequencer_url", None) or chain_id in (4663, 5462) else "RPC"
                 if max_calldata_ms > 0:
                     total_dispatch_ms = max_calldata_ms + max_bcast_ms
                     summary_time = f"<b>{total_dispatch_ms} ms</b> (OpenSea: {max_calldata_ms}ms | {bcast_target}: {max_bcast_ms}ms)"
@@ -621,7 +621,7 @@ class MintEngine:
                     return
                 t0 = time.time()
                 try:
-                    rec = await active_chain.wait_for_receipt(r.tx_hash, timeout_seconds=30.0, poll_interval=0.15)
+                    rec = await active_chain.wait_for_receipt(r.tx_hash, timeout_seconds=30.0, poll_interval=0.025)
                     r.confirm_time_seconds = round(time.time() - t0, 2)
                     r.total_time_seconds = round(time.time() - broadcast_start, 2)
                     if rec and not isinstance(rec, Exception):

@@ -225,16 +225,17 @@ class ChainClient:
                 return res
 
             tasks = [asyncio.create_task(send_to(u)) for u in endpoints]
+            for t in tasks:
+                t.add_done_callback(lambda t_done: t_done.exception() if not t_done.cancelled() else None)
 
             errors: list[Exception] = []
             for fut in asyncio.as_completed(tasks):
                 try:
                     res = await fut
                     if res:
-                        # Cancel slower endpoints immediately
-                        for t in tasks:
-                            if not t.done():
-                                t.cancel()
+                        # Return fastest endpoint immediately for minimum broadcast latency,
+                        # while allowing secondary endpoints (Alchemy + Sequencer) to complete delivery
+                        # in the background so both nodes have the transaction in local memory for instant receipts!
                         return res
                 except Exception as ex:
                     errors.append(ex)
@@ -269,16 +270,12 @@ class ChainClient:
         self,
         tx_hash: str,
         timeout_seconds: float = 30.0,
-        poll_interval: float = 0.15,
+        poll_interval: float = 0.025,
     ) -> TransactionReceipt | None:
         start_time = time.time()
-        poll_count = 0
         while time.time() - start_time < timeout_seconds:
             try:
-                poll_count += 1
-                # If primary RPC is lagging behind fast ~100ms blocks, alternate every 3rd poll to fallback/sequencer node
-                use_fb = (poll_count % 3 == 0) and bool(self.fallback_rpc_url and self.fallback_rpc_url != self.rpc_url)
-                res = await self.rpc_request("eth_getTransactionReceipt", [tx_hash], use_fallback=use_fb)
+                res = await self.rpc_request("eth_getTransactionReceipt", [tx_hash])
                 if res and isinstance(res, dict) and res.get("blockNumber") is not None:
                     return TransactionReceipt(
                         transaction_hash=tx_hash,

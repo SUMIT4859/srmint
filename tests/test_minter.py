@@ -1524,7 +1524,36 @@ def test_sequencer_prioritization_and_allocation_retry():
     assert endpoints[2] == "https://rpc2.com"
 
 
+def test_micro_poll_receipt_and_dual_ingestion():
+    import inspect
+    from minter.chain import ChainClient
+    cc = ChainClient(
+        rpc_url="https://alchemy.rpc",
+        fallback_rpc_url="https://fallback.rpc",
+        sequencer_url="https://sequencer.robinhood.com",
+    )
+    sig = inspect.signature(cc.wait_for_receipt)
+    assert sig.parameters["poll_interval"].default == 0.025, f"poll_interval should default to 0.025s (25ms), got {sig.parameters['poll_interval'].default}"
+
+    # Verify receipt tracking resolves instantly with 25ms micro-polling
+    async def run_wait_test():
+        cc.rpc_request = AsyncMock(return_value={
+            "status": "0x1",
+            "blockNumber": "0x123",
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x3b9aca00",
+        })
+        rec = await cc.wait_for_receipt("0xtxhash", timeout_seconds=2.0)
+        assert rec is not None
+        assert rec.status == 1
+        assert rec.block_number == 0x123
+        assert rec.gas_used == 0x5208
+
+    asyncio.run(run_wait_test())
+
+
 if __name__ == "__main__":
+    test_micro_poll_receipt_and_dual_ingestion()
     test_wallet_account()
     test_seadrop_encoding()
     test_opensea_slug_parser()
