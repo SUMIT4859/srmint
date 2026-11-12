@@ -23,6 +23,7 @@ MULTICALL3_AGGREGATE3_SELECTOR = bytes.fromhex("82ad56cb")
 # OpenSea Site and API URLs
 SITE_URL = "https://opensea.io"
 GRAPHQL_URL = "https://gql.opensea.io/graphql"
+OPENSEA_API_V2_URL = "https://api.opensea.io/api/v2"
 APP_ID = "os2-web"
 
 SIWE_STATEMENT = (

@@ -193,8 +193,18 @@ class ChainClient:
             max_fee_per_gas=max_fee,
         )
 
-    async def call(self, to: str, data: str) -> str:
-        tx = {"to": to_checksum_address(to), "data": data}
+    async def call(
+        self,
+        to: str,
+        data: str,
+        from_address: str | None = None,
+        value_wei: int = 0,
+    ) -> str:
+        tx: dict[str, Any] = {"to": to_checksum_address(to), "data": data}
+        if from_address:
+            tx["from"] = to_checksum_address(from_address)
+        if value_wei > 0:
+            tx["value"] = hex(value_wei)
         res = await self.rpc_request("eth_call", [tx, "latest"])
         return res
 

@@ -1728,7 +1728,189 @@ def test_fast_gas_mode():
     asyncio.run(run_test())
 
 
+def test_hybrid_rest_and_gql_mint_race():
+    """Verify official OpenSea REST v2 /drops/{slug}/mint races cleanly with GQL and falls back seamlessly on 429."""
+    from minter.client import CollectionInfo, DropStage, OpenSeaClient
+    from minter.wallet import WalletAccount
+
+    wallet = WalletAccount("0x" + "1" * 64)
+    coll = CollectionInfo(
+        name="HybridDrop", slug="hybrid-drop", contract_address="0x" + "2" * 40,
+        image_url="", chain_identifier="ROBINHOOD", chain_id=4663, total_supply=10, max_supply=100, stages=[],
+    )
+    stage = DropStage(
+        uuid="s1", label="Allowlist", stage_type="PRIVATE_SALE", stage_index=0,
+        start_time="", end_time="", start_timestamp=int(time.time()) - 5, end_timestamp=int(time.time()) + 100,
+        max_per_wallet=2, price_wei=1000, price_symbol="ETH", price_unit=0.0,
+    )
+
+    async def run_test():
+        client = OpenSeaClient(api_key="os_test_key_123")
+        client._authenticated_wallets.add(wallet.address.lower())
+        client._wallet_tokens[wallet.address.lower()] = "tok"
+
+        # Case 1: Fast REST wins race over slow GQL + preserves leading 0x00 calldata bytes
+        async def slow_gql_post(url, json=None, headers=None):
+            await asyncio.sleep(0.15)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.headers = {}
+            resp.json = lambda: {"data": {"swap": {"actions": [], "errors": []}}}
+            return resp
+
+        async def fast_rest_post(url, json=None, headers=None):
+            assert headers.get("x-api-key") == "os_test_key_123"
+            assert json["minter"] == wallet.address
+            assert json["skip_balance_check"] is True
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.headers = {}
+            resp.json = lambda: {
+                "to": "0x" + "3" * 40,
+                "data": "0x00abcdef",
+                "value": "1000",
+            }
+            return resp
+
+        mock_wallet_cl = AsyncMock()
+        mock_wallet_cl.is_closed = False
+        mock_wallet_cl.post = slow_gql_post
+        client._wallet_clients[wallet.address.lower()] = mock_wallet_cl
+
+        mock_rest_cl = AsyncMock()
+        mock_rest_cl.is_closed = False
+        mock_rest_cl.post = fast_rest_post
+        client._rest_client = mock_rest_cl
+
+        t0 = time.time()
+        act = await client.get_mint_action_hot(coll, wallet, 2, stage, max_attempts=2)
+        elapsed = time.time() - t0
+        assert act.calldata == b"\x00\xab\xcd\xef"
+        assert act.value == 1000
+        assert act.quantity == 2
+        assert elapsed < 0.08, f"Fast REST should win before slow GQL finishes (took {elapsed:.3f}s)"
+
+        # Case 2: REST hits 429 -> triggers circuit breaker and GQL seamlessly completes with MintAction
+        rest_calls = {"n": 0}
+
+        async def rest_429_post(url, json=None, headers=None):
+            rest_calls["n"] += 1
+            resp = MagicMock()
+            resp.status_code = 429
+            resp.headers = {"retry-after": "10"}
+            return resp
+
+        async def ok_gql_post(url, json=None, headers=None):
+            await asyncio.sleep(0.01)
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.headers = {}
+            resp.json = lambda: {
+                "data": {
+                    "swap": {
+                        "actions": [{
+                            "transactionSubmissionData": {
+                                "to": "0x" + "4" * 40,
+                                "data": "0x00112233",
+                                "value": "0",
+                            }
+                        }],
+                        "errors": [],
+                    }
+                }
+            }
+            return resp
+
+        mock_rest_cl.post = rest_429_post
+        mock_wallet_cl.post = ok_gql_post
+
+        act2 = await client.get_mint_action_hot(coll, wallet, 1, stage, max_attempts=2)
+        assert act2.calldata == b"\x00\x11\x22\x33"
+        assert client._rest_rate_limited_until > time.time()
+        assert rest_calls["n"] == 1
+
+        # Next call while circuit breaker active skips REST completely
+        await client.get_mint_action_hot(coll, wallet, 1, stage, max_attempts=2)
+        assert rest_calls["n"] == 1
+
+    asyncio.run(run_test())
+
+
+def test_revert_diagnosis_and_t0_timing():
+    """Verify failed tx receipt simulates exact contract error via eth_call and allowlist avoids firing 120ms early."""
+    from minter.chain import GasFees
+    from minter.client import CollectionInfo, DropStage, MintAction
+    from minter.engine import MintEngine, NonceTracker
+    from minter.wallet import WalletAccount
+
+    NonceTracker.reset()
+
+    async def run_test():
+        cfg = AppConfig()
+        cfg.broadcast_lead_ms = 80
+        wallet = WalletAccount("0x" + "d" * 64, label="DiagW")
+        coll = CollectionInfo(
+            name="DiagDrop", slug="diag-drop", contract_address="0x" + "5" * 40,
+            image_url="", chain_identifier="ROBINHOOD", chain_id=4663, total_supply=10, max_supply=10, stages=[],
+        )
+        start_ts = int(time.time()) + 1
+        stage = DropStage(
+            uuid="s1", label="Allowlist", stage_type="PRIVATE_SALE", stage_index=0,
+            start_time="", end_time="", start_timestamp=start_ts, end_timestamp=start_ts + 300,
+            max_per_wallet=1, price_wei=0, price_symbol="ETH", price_unit=0.0,
+        )
+
+        mock_chain = MagicMock()
+        mock_chain.rpc_url = "https://rpc.robinhood.org"
+        mock_chain.fallback_rpc_url = ""
+        mock_chain.timeout_seconds = 5.0
+        mock_chain.get_chain_id = AsyncMock(return_value=4663)
+        mock_chain.get_balances_batch = AsyncMock(return_value={wallet.address: int(1e18)})
+        mock_chain.get_nonces_batch = AsyncMock(return_value={wallet.address: 0})
+        mock_chain.get_gas_fees = AsyncMock(return_value=GasFees(20_000_000, 2_000_000, 27_000_000))
+        mock_chain.broadcast_raw_transaction = AsyncMock(return_value="0x" + "e" * 64)
+        mock_chain.wait_for_receipt = AsyncMock(return_value=MagicMock(status=0, gas_used=50000))
+
+        call_kwargs_seen: list[dict] = []
+
+        async def mock_eth_call(to, data, from_address=None, value_wei=0):
+            call_kwargs_seen.append({"to": to, "data": data, "from": from_address, "value": value_wei})
+            raise RuntimeError("execution reverted: 0x3a824151")
+
+        mock_chain.call = AsyncMock(side_effect=mock_eth_call)
+
+        t0_request_times: list[float] = []
+        mock_opensea = MagicMock()
+        mock_opensea.start_heartbeat = MagicMock()
+        mock_opensea.stop_heartbeat = MagicMock()
+        mock_opensea.authenticate_all_wallets = AsyncMock()
+        mock_opensea.api_key = ""
+
+        async def fake_hot(coll_arg, w_arg, qty_arg, stg_arg, **kwargs):
+            if kwargs.get("single_attempt"):
+                raise RuntimeError("Waiting for OpenSea stage activation...")
+            t0_request_times.append(time.time())
+            return MintAction(target="0x" + "6" * 40, value=0, calldata=b"\xde\xad\xbe\xef")
+
+        mock_opensea.get_mint_action_hot = AsyncMock(side_effect=fake_hot)
+
+        engine = MintEngine(cfg, mock_chain, mock_opensea)
+        results = await engine.execute_mint(coll, stage, [wallet], quantity_per_wallet=1)
+
+        assert results[0].status == "REVERTED"
+        assert "Drop sold out" in results[0].error_message, f"Expected decoded revert reason, got: {results[0].error_message}"
+        assert len(call_kwargs_seen) == 1
+        assert call_kwargs_seen[0]["from"] == wallet.address
+        assert t0_request_times[0] >= start_ts - 0.015, (
+            f"Allowlist should not fire 120ms early; fired at offset {t0_request_times[0] - start_ts:.3f}s"
+        )
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
+    test_hybrid_rest_and_gql_mint_race()
+    test_revert_diagnosis_and_t0_timing()
     test_fast_gas_mode()
     test_fast_429_retry_and_zero_stagger()
     test_sequencer_excluded_from_chain_constants()

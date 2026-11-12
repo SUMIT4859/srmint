@@ -303,6 +303,7 @@ class MintEngine:
 
             # Prepare transactions
             prepared_tx_map: dict[str, bytes] = {}
+            prepared_tx_meta: dict[str, tuple[str, int, bytes]] = {}
             wallets_needing_t0: list[WalletAccount] = []
 
             if is_public:
@@ -331,6 +332,7 @@ class MintEngine:
                     }
                     raw_bytes, tx_hash = w.sign_transaction(tx_dict)
                     prepared_tx_map[w.address] = raw_bytes
+                    prepared_tx_meta[w.address] = (OPENSEA_SEADROP_ADDRESS, val, cdata)
                     for r in results:
                         if r.wallet.address == w.address:
                             r.quantity = w_qty
@@ -390,6 +392,11 @@ class MintEngine:
                         }
                         raw_bytes, tx_hash = w.sign_transaction(tx_dict)
                         prepared_tx_map[w.address] = raw_bytes
+                        prepared_tx_meta[w.address] = (
+                            to_checksum_address(act_res.target),
+                            act_res.value,
+                            act_res.calldata,
+                        )
                         r.tx_hash = tx_hash
                         r.explorer_url = get_tx_explorer_url(chain_id, tx_hash)
                         prefetched_actions[w.address] = act_res
@@ -439,9 +446,16 @@ class MintEngine:
                 else:
                     await notify(f"⏳ Calldata will unlock at T-0. Pipelined workers ready for {len(wallets_needing_t0)} wallet(s).")
 
-            # 5. High-Precision Countdown to T-0 with RPC & GraphQL Pre-Warmup & Lead Offset Compensation
+            # 5. High-Precision Countdown to T-0 with RPC & OpenSea Pre-Warmup & Smart Lead Offset
             if target_start_ts > time.time():
-                lead_seconds = max(self.config.broadcast_lead_ms / 1000.0, 0.12)
+                needs_os_at_t0 = len(wallets_needing_t0) > 0
+                cfg_lead = max(0.0, self.config.broadcast_lead_ms / 1000.0)
+                if needs_os_at_t0:
+                    # OpenSea unlocks allowlist calldata at T-0; do NOT fire 120ms early and waste a failed RTT
+                    lead_seconds = min(cfg_lead, 0.005)
+                else:
+                    # Direct SeaDrop / pre-signed: small 30ms lead beats T-0 without landing in a T-1s block
+                    lead_seconds = min(cfg_lead, 0.030)
                 target_broadcast_time = target_start_ts - lead_seconds
 
                 rem = target_broadcast_time - time.time()
@@ -460,6 +474,8 @@ class MintEngine:
                                 headers=self.opensea._get_headers(slug=collection.slug),
                             ),
                         ]
+                        if isinstance(self.opensea, OpenSeaClient) and self.opensea.api_key:
+                            warm_coros.append(self.opensea.warmup_rest())
                         if active_chain.fallback_rpc_url and active_chain.fallback_rpc_url != active_chain.rpc_url:
                             warm_coros.append(active_chain.rpc_request("eth_blockNumber", [], use_fallback=True))
                         for w, w_cl in zip(wallets, w_clients):
@@ -522,7 +538,7 @@ class MintEngine:
                             w_qty,
                             stage,
                             max_attempts=self.config.max_retry_attempts,
-                            retry_interval_ms=25,
+                            retry_interval_ms=10,
                         )
                         r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                         actual_qty = act.quantity
@@ -559,6 +575,11 @@ class MintEngine:
                     "data": act.calldata,
                 }
                 raw_bytes, tx_hash = w.sign_transaction(tx_dict)
+                prepared_tx_meta[w.address] = (
+                    to_checksum_address(act.target),
+                    act.value,
+                    act.calldata,
+                )
                 r.tx_hash = tx_hash
                 r.explorer_url = get_tx_explorer_url(chain_id, tx_hash)
 
@@ -620,15 +641,27 @@ class MintEngine:
                         else:
                             r.status = "REVERTED"
                             r.error_message = "Transaction reverted on-chain"
-                            # Attempt to diagnose exact on-chain error
-                            try:
-                                cdata_hex = "0x" + cdata_map.get(r.wallet.address, b"").hex() if "cdata_map" in locals() else ""
-                                if cdata_hex and cdata_hex != "0x":
-                                    call_res = await active_chain.call(to=OPENSEA_SEADROP_ADDRESS, data=cdata_hex)
-                            except Exception as sim_ex:
-                                d_err = decode_seadrop_error(str(sim_ex))
-                                if d_err:
-                                    r.error_message = f"Reverted: {d_err}" 
+                            # Simulate failed tx via eth_call to extract exact contract revert reason
+                            meta = prepared_tx_meta.get(r.wallet.address)
+                            if meta:
+                                to_addr, val_wei, cdata_bytes = meta
+                                cdata_hex = "0x" + cdata_bytes.hex()
+                                try:
+                                    try:
+                                        await active_chain.call(
+                                            to_addr,
+                                            cdata_hex,
+                                            from_address=r.wallet.address,
+                                            value_wei=val_wei,
+                                        )
+                                    except TypeError:
+                                        await active_chain.call(to_addr, cdata_hex)
+                                except Exception as sim_ex:
+                                    d_err = decode_seadrop_error(str(sim_ex))
+                                    if d_err:
+                                        r.error_message = f"Reverted: {d_err}"
+                                    else:
+                                        r.error_message = f"Reverted: {str(sim_ex)[:120]}"
                     else:
                         r.status = "UNCONFIRMED"
                         r.error_message = "Timeout waiting for on-chain receipt"

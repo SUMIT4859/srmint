@@ -17,6 +17,7 @@ from .constants import (
     APP_ID,
     GET_PUBLIC_DROP_SELECTOR,
     GRAPHQL_URL,
+    OPENSEA_API_V2_URL,
     OPENSEA_SEADROP_ADDRESS,
     SITE_URL,
     SIWE_STATEMENT,
@@ -253,6 +254,8 @@ class OpenSeaClient:
         self.timeout_seconds = timeout_seconds
         self.api_key = api_key
         self._client: httpx.AsyncClient | None = None
+        self._rest_client: httpx.AsyncClient | None = None
+        self._rest_rate_limited_until: float = 0.0
         self._wallet_clients: dict[str, httpx.AsyncClient] = {}  # address -> isolated httpx.AsyncClient
         self._wallet_sessions: dict[str, dict[str, str]] = {}  # address -> cookies/headers
         self._wallet_tokens: dict[str, str] = {}  # address -> access_token
@@ -304,6 +307,31 @@ class OpenSeaClient:
             self._wallet_clients[addr] = cl
         return cl
 
+    async def get_rest_client(self) -> httpx.AsyncClient:
+        """Dedicated HTTP/2 pool for OpenSea Developer REST API v2 (api.opensea.io)."""
+        if self._rest_client is None or self._rest_client.is_closed:
+            self._rest_client = httpx.AsyncClient(
+                timeout=self.timeout_seconds,
+                headers={"accept": "application/json", "user-agent": "OpenSeaMintBot/2.0"},
+                limits=httpx.Limits(max_connections=25, max_keepalive_connections=25, keepalive_expiry=120.0),
+                http2=True,
+                follow_redirects=True,
+            )
+        return self._rest_client
+
+    async def warmup_rest(self) -> None:
+        """Pre-warm TLS/HTTP2 socket to api.opensea.io without consuming rate-limit quota."""
+        if not self.api_key:
+            return
+        try:
+            rest_cl = await self.get_rest_client()
+            await rest_cl.head(
+                f"{OPENSEA_API_V2_URL}/",
+                headers={"x-api-key": self.api_key, "accept": "application/json"},
+            )
+        except Exception:
+            pass
+
     async def close(self) -> None:
         self.stop_heartbeat()
         self._authenticated_wallets.clear()
@@ -311,6 +339,8 @@ class OpenSeaClient:
         self._wallet_stage_elig_cache.clear()
         if self._client and not self._client.is_closed:
             await self._client.aclose()
+        if self._rest_client and not self._rest_client.is_closed:
+            await self._rest_client.aclose()
         for cl in self._wallet_clients.values():
             if not cl.is_closed:
                 await cl.aclose()
@@ -372,6 +402,8 @@ class OpenSeaClient:
                             headers=self._get_headers(w.address, slug=slug),
                         )
                     )
+                if self.api_key:
+                    tasks.append(self.warmup_rest())
                 await asyncio.gather(*tasks, return_exceptions=True)
             except asyncio.CancelledError:
                 break
@@ -395,12 +427,7 @@ class OpenSeaClient:
     async def resolve_contract_to_slug(self, contract_address: str) -> str | None:
         """Resolve a contract address to an OpenSea collection slug."""
         client = await self.get_client()
-        headers = {
-            "accept": "application/json",
-            "origin": SITE_URL,
-            "referer": SITE_URL,
-            "x-app-id": APP_ID,
-        }
+        headers = self._get_headers()
         chains_to_try = ["ROBINHOOD", "INK", "SONEIUM", "ELYSIUM", "BASE", "ARBITRUM", "ETHEREUM", "POLYGON", "OPTIMISM", "ZORA"]
         checksummed = to_checksum_address(contract_address)
 
@@ -506,12 +533,7 @@ class OpenSeaClient:
             "query": COLLECTION_QUERY,
             "variables": {"slug": slug},
         }
-        headers = {
-            "accept": "application/json",
-            "origin": SITE_URL,
-            "referer": f"{SITE_URL}/collection/{slug}",
-            "x-app-id": APP_ID,
-        }
+        headers = self._get_headers(slug=slug)
         resp = await client.post(GRAPHQL_URL, json=payload, headers=headers)
         resp.raise_for_status()
         data = resp.json().get("data", {})
@@ -644,6 +666,199 @@ class OpenSeaClient:
         tasks = [self.authenticate_wallet(w, chain_id, slug) for w in wallets]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+    @staticmethod
+    def _build_mint_action(
+        to_raw: str | None,
+        data_raw: str,
+        value_raw: Any,
+        quantity: int,
+        attempt: int,
+    ) -> MintAction | None:
+        if not isinstance(data_raw, str):
+            return None
+        hex_body = data_raw[2:] if data_raw.startswith(("0x", "0X")) else data_raw
+        if not hex_body or (len(hex_body) % 2 != 0):
+            return None
+        try:
+            calldata = bytes.fromhex(hex_body)
+        except ValueError:
+            return None
+
+        target = to_checksum_address(to_raw or OPENSEA_SEADROP_ADDRESS)
+        if isinstance(value_raw, str):
+            val = int(value_raw, 16) if value_raw.startswith(("0x", "0X")) else int(value_raw or "0")
+        else:
+            val = int(value_raw or 0)
+        return MintAction(target=target, value=val, calldata=calldata, quantity=quantity, attempts=attempt)
+
+    async def _query_rest_mint_action_once(
+        self,
+        collection: CollectionInfo,
+        wallet: WalletAccount,
+        stage: DropStage,
+        current_q: int,
+        attempt: int,
+    ) -> tuple[str, Any, float]:
+        """Try official OpenSea API v2 drop mint endpoint; never blocks GQL fallback."""
+        try:
+            rest_cl = await self.get_rest_client()
+            resp = await rest_cl.post(
+                f"{OPENSEA_API_V2_URL}/drops/{collection.slug}/mint",
+                json={
+                    "minter": wallet.address,
+                    "quantity": current_q,
+                    "skip_balance_check": True,
+                },
+                headers={
+                    "accept": "application/json",
+                    "content-type": "application/json",
+                    "x-api-key": self.api_key,
+                },
+            )
+            if resp.status_code == 200:
+                payload = resp.json()
+                tx_obj = payload.get("transaction") if isinstance(payload.get("transaction"), dict) else payload
+                if isinstance(tx_obj, dict):
+                    act = self._build_mint_action(
+                        tx_obj.get("to"),
+                        tx_obj.get("data", ""),
+                        tx_obj.get("value", 0),
+                        current_q,
+                        attempt,
+                    )
+                    if act is not None:
+                        return ("ok", act, 0.0)
+                return ("unavailable", RuntimeError("Empty calldata from OpenSea REST API"), 0.0)
+
+            if resp.status_code == 429:
+                retry_hdr = resp.headers.get("retry-after")
+                cooldown = 15.0
+                if retry_hdr:
+                    try:
+                        cooldown = min(60.0, max(2.0, float(retry_hdr)))
+                    except ValueError:
+                        cooldown = 15.0
+                self._rest_rate_limited_until = time.time() + cooldown
+                return ("unavailable", RuntimeError("OpenSea REST API 429 rate limited"), 0.0)
+
+            if resp.status_code in (401, 403):
+                self._rest_rate_limited_until = time.time() + 300.0
+                return ("unavailable", RuntimeError(f"OpenSea REST API HTTP {resp.status_code}"), 0.0)
+
+            if resp.status_code == 422:
+                body_lower = resp.text.lower()
+                if any(k in body_lower for k in ("exceed", "allocation", "quantity", "maximum", "supply")):
+                    if current_q > 1:
+                        return ("decrement", RuntimeError("REST allocation exceeded"), 0.0)
+                return ("unavailable", RuntimeError("REST 422"), 0.0)
+
+            return ("unavailable", RuntimeError(f"OpenSea REST HTTP {resp.status_code}"), 0.0)
+        except Exception as ex:
+            return ("unavailable", ex, 0.0)
+
+    async def _query_gql_mint_action_once(
+        self,
+        client: httpx.AsyncClient,
+        stage: DropStage,
+        variables: dict[str, Any],
+        headers: dict[str, str],
+        attempt: int,
+    ) -> tuple[str, Any, float]:
+        """Execute one attempt against OpenSea GraphQL (os2-web) MintActionTimelineQuery."""
+        try:
+            resp = await client.post(
+                GRAPHQL_URL,
+                json={
+                    "operationName": "MintActionTimelineQuery",
+                    "query": MINT_ACTION_QUERY,
+                    "variables": variables,
+                },
+                headers=headers,
+            )
+
+            if resp.status_code == 429:
+                retry_after_hdr = resp.headers.get("retry-after")
+                if retry_after_hdr:
+                    try:
+                        delay = min(1.0, max(0.05, float(retry_after_hdr)))
+                    except ValueError:
+                        delay = 0.08 + random.uniform(0.01, 0.02)
+                else:
+                    delay = min(1.0, 0.06 * (1.4 ** attempt) + random.uniform(0.01, 0.02))
+                return ("retry", RuntimeError(f"OpenSea: Rate Limited (HTTP 429), backing off {delay:.2f}s"), delay)
+
+            if resp.status_code != 200:
+                delay = min(1.0, 0.06 * (1.3 ** attempt) + random.uniform(0.01, 0.02))
+                return ("retry", RuntimeError(f"OpenSea HTTP {resp.status_code}"), delay)
+
+            resp_json = resp.json()
+            errors = resp_json.get("errors") or []
+            last_err: Exception | None = None
+            if errors:
+                err_msgs = [e.get("message", "") for e in errors if isinstance(e, dict)]
+                err_text = ", ".join(err_msgs)
+
+                if "too many requests" in err_text.lower() or "rate limit" in err_text.lower() or "throttled" in err_text.lower():
+                    delay = min(1.0, 0.06 * (1.4 ** attempt) + random.uniform(0.01, 0.02))
+                    return ("retry", RuntimeError(f"OpenSea: Rate Limited ({err_text}), backing off {delay:.2f}s"), delay)
+
+                if "can not perform trading operations" in err_text.lower() or "cannot perform trading operations" in err_text.lower():
+                    return ("fatal_elig", RuntimeError("Wallet is not on the Allowlist / Not eligible for this private stage"), 0.0)
+
+                last_err = RuntimeError(f"OpenSea: {err_text}")
+
+            data = resp_json.get("data")
+            if data and isinstance(data, dict):
+                swap = data.get("swap") or {}
+                actions = swap.get("actions", [])
+                if actions:
+                    sub_data = actions[0].get("transactionSubmissionData", {})
+                    if sub_data and "data" in sub_data:
+                        actual_qty = int(variables["toAssets"][0]["quantity"])
+                        act = self._build_mint_action(
+                            sub_data.get("to"),
+                            sub_data["data"],
+                            sub_data.get("value", 0),
+                            actual_qty,
+                            attempt,
+                        )
+                        if act is not None:
+                            return ("ok", act, 0.0)
+
+                swap_errors = swap.get("errors", [])
+                if swap_errors:
+                    err_names = [e.get("__typename", "") for e in swap_errors if isinstance(e, dict)]
+                    is_not_started = (
+                        "MinterNotEligibleForActiveDropStageError" in err_names
+                        or "DropStageNotStartedError" in err_names
+                        or "DropStageInactiveError" in err_names
+                        or "DropNotStartedError" in err_names
+                        or "StageNotActiveError" in err_names
+                    )
+                    if is_not_started:
+                        now_ts = time.time()
+                        if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
+                            # Tight 10ms poll right around T-0, 25ms otherwise inside activation window
+                            tight_t0 = abs(now_ts - stage.start_timestamp) <= 2.5
+                            return ("retry", RuntimeError("Waiting for OpenSea stage activation..."), 0.010 if tight_t0 else 0.025)
+                        return ("fatal", RuntimeError("Wallet is not on the Allowlist for this stage"), 0.0)
+
+                    if "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
+                        current_q = int(variables["toAssets"][0]["quantity"])
+                        if current_q > 1:
+                            return ("decrement", RuntimeError("Quantity exceeds allocation"), 0.0)
+                        now_ts = time.time()
+                        is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
+                        if is_transition_window and attempt < 5:
+                            return ("retry", RuntimeError("Waiting for OpenSea stage allocation unlock..."), 0.015)
+                        return ("fatal", RuntimeError("Stage supply pool exhausted / allocation limit reached on OpenSea"), 0.0)
+
+                    last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
+
+            return ("fallback_retry", last_err or RuntimeError("Empty OpenSea GraphQL response"), 0.0)
+        except Exception as e:
+            return ("exception", e, 0.0)
+
     async def get_mint_action_hot(
         self,
         collection: CollectionInfo,
@@ -654,7 +869,7 @@ class OpenSeaClient:
         retry_interval_ms: int = 200,
         single_attempt: bool = False,
     ) -> MintAction:
-        """Fetch private/allowlist mint calldata with rate-limit protection and adaptive retry."""
+        """Fetch private/allowlist mint calldata using Hybrid REST v2 + GraphQL race with adaptive retry."""
         client = await self.get_wallet_client(wallet.address)
         zero_addr = "0x0000000000000000000000000000000000000000"
         variables = {
@@ -682,136 +897,92 @@ class OpenSeaClient:
 
         headers = self._get_headers(wallet.address, collection.slug)
 
-        last_err = None
+        last_err: Exception | None = None
         attempts = 1 if single_attempt else max_attempts
         for attempt in range(1, attempts + 1):
-            try:
-                resp = await client.post(
-                    GRAPHQL_URL,
-                    json={
-                        "operationName": "MintActionTimelineQuery",
-                        "query": MINT_ACTION_QUERY,
-                        "variables": variables,
-                    },
-                    headers=headers,
+            current_q = int(variables["toAssets"][0]["quantity"])
+            use_rest = bool(self.api_key) and time.time() >= self._rest_rate_limited_until
+
+            if use_rest:
+                gql_task = asyncio.create_task(
+                    self._query_gql_mint_action_once(client, stage, variables, headers, attempt)
+                )
+                rest_task = asyncio.create_task(
+                    self._query_rest_mint_action_once(collection, wallet, stage, current_q, attempt)
+                )
+                done, pending = await asyncio.wait({gql_task, rest_task}, return_when=asyncio.FIRST_COMPLETED)
+
+                gql_res: tuple[str, Any, float] | None = None
+                rest_res: tuple[str, Any, float] | None = None
+
+                for t in done:
+                    res = t.result()
+                    if res[0] == "ok":
+                        for pt in pending:
+                            pt.cancel()
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        return res[1]
+                    if t is gql_task:
+                        gql_res = res
+                    else:
+                        rest_res = res
+
+                if pending:
+                    rem_results = await asyncio.gather(*pending, return_exceptions=True)
+                    for pt, res in zip(pending, rem_results):
+                        if isinstance(res, tuple) and res[0] == "ok":
+                            return res[1]
+                        if pt is gql_task and isinstance(res, tuple):
+                            gql_res = res
+                        elif pt is rest_task and isinstance(res, tuple):
+                            rest_res = res
+
+                status, payload, delay = gql_res or ("fallback_retry", RuntimeError("OpenSea unavailable"), 0.0)
+                if status != "decrement" and rest_res and rest_res[0] == "decrement" and current_q > 1:
+                    status = "decrement"
+            else:
+                status, payload, delay = await self._query_gql_mint_action_once(
+                    client, stage, variables, headers, attempt
                 )
 
-                # 1. Handle HTTP 429 Too Many Requests
-                if resp.status_code == 429:
-                    retry_after_hdr = resp.headers.get("retry-after")
-                    if retry_after_hdr:
-                        try:
-                            delay = min(1.0, max(0.05, float(retry_after_hdr)))
-                        except ValueError:
-                            delay = 0.08 + random.uniform(0.01, 0.02)
-                    else:
-                        delay = min(1.0, 0.06 * (1.4 ** attempt) + random.uniform(0.01, 0.02))
+            if status == "ok":
+                return payload
 
-                    last_err = RuntimeError(f"OpenSea: Rate Limited (HTTP 429), backing off {delay:.2f}s")
-                    if single_attempt:
-                        raise last_err
-                    await asyncio.sleep(delay)
+            last_err = payload if isinstance(payload, Exception) else RuntimeError(str(payload))
+            if single_attempt:
+                raise last_err
+
+            if status == "decrement":
+                if current_q > 1:
+                    variables["toAssets"][0]["quantity"] = str(current_q - 1)
                     continue
+                raise last_err
 
-                if resp.status_code != 200:
-                    last_err = RuntimeError(f"OpenSea HTTP {resp.status_code}")
-                    if single_attempt:
-                        raise last_err
-                    delay = min(1.0, 0.06 * (1.3 ** attempt) + random.uniform(0.01, 0.02))
-                    await asyncio.sleep(delay)
-                    continue
+            if status == "fatal":
+                raise last_err
 
-                resp_json = resp.json()
-                errors = resp_json.get("errors") or []
-                if errors:
-                    err_msgs = [e.get("message", "") for e in errors if isinstance(e, dict)]
-                    err_text = ", ".join(err_msgs)
-
-                    # GraphQL rate limit error
-                    if "too many requests" in err_text.lower() or "rate limit" in err_text.lower() or "throttled" in err_text.lower():
-                        delay = min(1.0, 0.06 * (1.4 ** attempt) + random.uniform(0.01, 0.02))
-                        last_err = RuntimeError(f"OpenSea: Rate Limited ({err_text}), backing off {delay:.2f}s")
-                        if single_attempt:
-                            raise last_err
-                        await asyncio.sleep(delay)
-                        continue
-
-                    if "can not perform trading operations" in err_text.lower() or "cannot perform trading operations" in err_text.lower():
-                        raise RuntimeError("Wallet is not on the Allowlist / Not eligible for this private stage")
-
-                    last_err = RuntimeError(f"OpenSea: {err_text}")
-
-                data = resp_json.get("data")
-                if data and isinstance(data, dict):
-                    swap = data.get("swap") or {}
-                    actions = swap.get("actions", [])
-                    if actions:
-                        sub_data = actions[0].get("transactionSubmissionData", {})
-                        if sub_data and "data" in sub_data:
-                            target = to_checksum_address(sub_data.get("to", OPENSEA_SEADROP_ADDRESS))
-                            val_raw = sub_data.get("value", 0)
-                            if isinstance(val_raw, str):
-                                val = int(val_raw, 16) if val_raw.startswith("0x") else int(val_raw)
-                            else:
-                                val = int(val_raw)
-                            calldata = bytes.fromhex(sub_data["data"].lstrip("0x"))
-                            actual_qty = int(variables["toAssets"][0]["quantity"])
-                            return MintAction(target=target, value=val, calldata=calldata, quantity=actual_qty, attempts=attempt)
-
-                    swap_errors = swap.get("errors", [])
-                    if swap_errors:
-                        err_names = [e.get("__typename", "") for e in swap_errors if isinstance(e, dict)]
-                        is_not_started = (
-                            "MinterNotEligibleForActiveDropStageError" in err_names
-                            or "DropStageNotStartedError" in err_names
-                            or "DropStageInactiveError" in err_names
-                            or "DropNotStartedError" in err_names
-                            or "StageNotActiveError" in err_names
-                        )
-                        if is_not_started:
-                            if single_attempt:
-                                raise RuntimeError("Waiting for OpenSea stage activation...")
-                            now_ts = time.time()
-                            # If target stage has not started yet or within transition window, wait for activation
-                            if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
-                                last_err = RuntimeError("Waiting for OpenSea stage activation...")
-                                # Rapid 25ms poll during activation window to grab calldata immediately when live!
-                                await asyncio.sleep(0.025)
-                                continue
-                            else:
-                                raise RuntimeError("Wallet is not on the Allowlist for this stage")
-                        elif "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
-                            # Dynamic allocation fallback: If quantity > 1, immediately retry with decremented quantity!
-                            current_q = int(variables["toAssets"][0]["quantity"])
-                            if current_q > 1:
-                                variables["toAssets"][0]["quantity"] = str(current_q - 1)
-                                continue
-
-                            now_ts = time.time()
-                            is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
-                            if is_transition_window and attempt < 5 and not single_attempt:
-                                last_err = RuntimeError("Waiting for OpenSea stage allocation unlock...")
-                                await asyncio.sleep(0.025)
-                                continue
-                            raise RuntimeError("Stage supply pool exhausted / allocation limit reached on OpenSea")
-                        else:
-                            last_err = RuntimeError(f"OpenSea: {', '.join(err_names)}")
-            except Exception as e:
-                last_err = e
-                if single_attempt:
-                    raise e
-                # If definitely not eligible outside transition window, stop retrying immediately
+            if status == "fatal_elig":
                 now_ts = time.time()
                 is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
-                err_str = str(e).lower()
+                if not is_transition_window:
+                    raise last_err
+
+            if status == "exception":
+                now_ts = time.time()
+                is_transition_window = stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0)
+                err_str = str(last_err).lower()
                 if "supply pool exhausted" in err_str or "allocation limit reached" in err_str:
                     if not is_transition_window or attempt >= 5:
-                        raise e
+                        raise last_err
                 if not is_transition_window:
                     if "not on the allowlist" in err_str or "not eligible" in err_str:
-                        raise e
+                        raise last_err
 
-            # Adaptive retry sleep
+            if status == "retry" and delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
             if attempt < attempts:
                 await asyncio.sleep(retry_interval_ms / 1000.0)
 
