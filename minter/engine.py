@@ -426,15 +426,7 @@ class MintEngine:
 
             # 5. High-Precision Countdown to T-0 with RPC & GraphQL Pre-Warmup & Lead Offset Compensation
             if target_start_ts > time.time():
-                if wallets_needing_t0:
-                    # When live allowlist calldata is needed from OpenSea at T-0:
-                    # Firing early causes OpenSea to reject with DropStageNotStartedError and triggers retry loops.
-                    # Firing 5ms before T-0 ensures the packet arrives at OpenSea's server right as the stage activates,
-                    # returning calldata on Attempt 1 in ~100-120ms with 0 retries!
-                    lead_seconds = min(max(self.config.broadcast_lead_ms / 1000.0, 0.0), 0.005)
-                else:
-                    # For pre-signed transactions, lead by configured broadcast lead (e.g. 80ms) to hit mempool on block open
-                    lead_seconds = max(self.config.broadcast_lead_ms / 1000.0, 0.05)
+                lead_seconds = max(self.config.broadcast_lead_ms / 1000.0, 0.12)
                 target_broadcast_time = target_start_ts - lead_seconds
 
                 rem = target_broadcast_time - time.time()
