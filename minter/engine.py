@@ -128,6 +128,7 @@ class MintEngine:
         quantity_per_wallet: int = 1,
         wallet_quantities: dict[str, int] | None = None,
         expected_price_wei: int | None = None,
+        fast_mode: bool = False,
         on_progress: Callable[[str], asyncio.Future[Any] | Any] | None = None,
     ) -> list[WalletMintResult]:
         self._cancel_requested = False
@@ -180,10 +181,11 @@ class MintEngine:
         now = int(time.time())
         is_scheduled = stage.start_timestamp > now
 
+        gas_badge = " | Gas: ⚡ FAST" if fast_mode else ""
         await notify(
             f"⚡ Initializing {'Public' if is_public else 'Allowlist'} Mint for {len(wallets)} wallet(s)...\n"
             f"Collection: <b>{collection.name}</b>\n"
-            f"Stage: <b>{stage.label}</b> | Price: <b>{stage.price_unit} {stage.price_symbol}</b>"
+            f"Stage: <b>{stage.label}</b> | Price: <b>{stage.price_unit} {stage.price_symbol}</b>{gas_badge}"
         )
 
         # 1. OpenSea session warmup & authentication (for private stages)
@@ -208,6 +210,7 @@ class MintEngine:
                 active_chain.get_gas_fees(
                     fee_multiplier=self.config.fee_multiplier,
                     priority_fee_gwei=self.config.max_priority_fee_gwei,
+                    fast_mode=fast_mode,
                 ),
                 return_exceptions=True,
             )
@@ -286,6 +289,7 @@ class MintEngine:
                 active_chain.get_gas_fees(
                     fee_multiplier=fee_mult,
                     priority_fee_gwei=self.config.max_priority_fee_gwei,
+                    fast_mode=fast_mode,
                 ),
                 return_exceptions=True,
             )

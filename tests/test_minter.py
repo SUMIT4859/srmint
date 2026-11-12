@@ -1598,7 +1598,138 @@ def test_fast_429_retry_and_zero_stagger():
     asyncio.run(run_test())
 
 
+def test_fast_gas_mode():
+    """Verify Fast Gas Mode boosts L1/L2 priority & max fees when enabled, preserves normal behavior by default, and toggles cleanly per card."""
+    from bot import TelegramBot
+    from minter.chain import ChainClient, GasFees
+    from minter.client import CollectionInfo, DropStage, MintAction
+    from minter.engine import MintEngine, NonceTracker
+    from minter.wallet import WalletAccount, WalletManager
+
+    NonceTracker.reset()
+
+    async def run_test():
+        # 1. Verify ChainClient.get_gas_fees normal vs fast on L2 (Robinhood 4663) and L1 (Ethereum 1)
+        async def eval_chain_gas(chain_id: int, base_fee: int, rpc_priority: int, fast: bool) -> GasFees:
+            cc = ChainClient("https://rpc.example.com")
+            cc.get_chain_id = AsyncMock(return_value=chain_id)
+
+            async def fake_rpc(method: str, params=None):
+                if method == "eth_getBlockByNumber":
+                    return {"baseFeePerGas": hex(base_fee)}
+                if method == "eth_maxPriorityFeePerGas":
+                    return hex(rpc_priority)
+                if method == "eth_gasPrice":
+                    return hex(base_fee + rpc_priority)
+                return None
+
+            cc.rpc_request = fake_rpc
+            return await cc.get_gas_fees(fee_multiplier=1.25, priority_fee_gwei=0.002, fast_mode=fast)
+
+        l2_normal = await eval_chain_gas(4663, 20_000_000, 1_000_000, fast=False)
+        l2_fast = await eval_chain_gas(4663, 20_000_000, 1_000_000, fast=True)
+        assert l2_normal.max_priority_fee_per_gas <= 2_000_000, f"L2 normal priority should stay normal (<=2_000_000), got {l2_normal.max_priority_fee_per_gas}"
+        assert l2_fast.max_priority_fee_per_gas >= 100_000_000, f"L2 fast priority should be >=0.1 Gwei, got {l2_fast.max_priority_fee_per_gas}"
+        assert l2_fast.max_fee_per_gas > l2_normal.max_fee_per_gas
+
+        l1_normal = await eval_chain_gas(1, 10_000_000_000, 500_000_000, fast=False)
+        l1_fast = await eval_chain_gas(1, 10_000_000_000, 500_000_000, fast=True)
+        assert l1_fast.max_priority_fee_per_gas >= 2_000_000_000, f"L1 fast priority should be >=2 Gwei, got {l1_fast.max_priority_fee_per_gas}"
+        assert l1_fast.max_fee_per_gas >= int(10_000_000_000 * 2.5)
+        assert l1_fast.max_fee_per_gas > l1_normal.max_fee_per_gas
+
+        # 2. Verify MintEngine.execute_mint forwards fast_mode cleanly without affecting normal mode
+        cfg = AppConfig()
+        cfg.broadcast_lead_ms = 0
+        wallet = WalletAccount(private_key="0x" + "b" * 64, label="W1")
+        coll = CollectionInfo(
+            name="FastGasColl", slug="fast-gas-coll", contract_address="0x" + "3" * 40,
+            image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=10, max_supply=100, stages=[],
+        )
+        stage = DropStage(
+            uuid="s1", label="Public", stage_type="PUBLIC_SALE", stage_index=0,
+            start_time="", end_time="", start_timestamp=int(time.time()) - 10, end_timestamp=int(time.time()) + 300,
+            max_per_wallet=1, price_wei=0, price_symbol="ETH", price_unit=0.0,
+        )
+
+        seen_fast_flags: list[bool] = []
+        mock_chain = MagicMock()
+        mock_chain.rpc_url = "https://rpc.robinhood.org"
+        mock_chain.fallback_rpc_url = ""
+        mock_chain.timeout_seconds = 5.0
+        mock_chain.get_chain_id = AsyncMock(return_value=4663)
+        mock_chain.get_balances_batch = AsyncMock(return_value={wallet.address: int(1e18)})
+        mock_chain.get_nonces_batch = AsyncMock(return_value={wallet.address: 0})
+
+        async def mock_get_gas_fees(fee_multiplier=1.25, priority_fee_gwei=0.002, fast_mode=False):
+            seen_fast_flags.append(bool(fast_mode))
+            if fast_mode:
+                return GasFees(20_000_000, 100_000_000, 160_000_000)
+            return GasFees(20_000_000, 2_000_000, 27_000_000)
+
+        mock_chain.get_gas_fees = AsyncMock(side_effect=mock_get_gas_fees)
+        mock_chain.broadcast_raw_transaction = AsyncMock(return_value="0x" + "c" * 64)
+        mock_chain.wait_for_receipt = AsyncMock(return_value=MagicMock(status=1, gas_used=120000))
+
+        mock_opensea = MagicMock()
+        mock_opensea.start_heartbeat = MagicMock()
+        mock_opensea.stop_heartbeat = MagicMock()
+        mock_opensea.get_mint_action_hot = AsyncMock(return_value=MintAction(
+            target="0x" + "4" * 40, value=0, calldata=b"\xab\xcd",
+        ))
+
+        engine = MintEngine(cfg, mock_chain, mock_opensea)
+        res_normal = await engine.execute_mint(coll, stage, [wallet], quantity_per_wallet=1, fast_mode=False)
+        assert res_normal[0].status == "SUCCESS"
+        assert all(f is False for f in seen_fast_flags)
+
+        seen_fast_flags.clear()
+        res_fast = await engine.execute_mint(coll, stage, [wallet], quantity_per_wallet=1, fast_mode=True)
+        assert res_fast[0].status == "SUCCESS"
+        assert len(seen_fast_flags) >= 1 and all(f is True for f in seen_fast_flags)
+
+        # 3. Verify TelegramBot Mint Card toggle defaults to False and isolates per-card fast_mode
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            w_mgr = WalletManager(str(Path(tmp_dir) / "wallets.json"))
+            w = w_mgr.add_wallet("0x" + "b" * 64, label="W1")
+            bot = TelegramBot(cfg, w_mgr)
+            bot.answer_callback = AsyncMock()
+            bot.edit_message = AsyncMock()
+
+            coll_a = CollectionInfo(name="CollA", slug="colla", contract_address="0x" + "1" * 40, image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=10, max_supply=100, stages=[stage])
+            coll_b = CollectionInfo(name="CollB", slug="collb", contract_address="0x" + "2" * 40, image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=10, max_supply=100, stages=[stage])
+
+            bot._card_sessions[100] = {
+                "message_id": 100, "chat_id": 12345, "collection": coll_a,
+                "selected_stage": stage, "quantity": 1, "selected_wallets": [w],
+                "expected_price_wei": 0, "expected_price_unit": 0.0, "expected_price_symbol": "ETH",
+                "fast_mode": False,
+            }
+            bot._card_sessions[200] = {
+                "message_id": 200, "chat_id": 12345, "collection": coll_b,
+                "selected_stage": stage, "quantity": 1, "selected_wallets": [w],
+                "expected_price_wei": 0, "expected_price_unit": 0.0, "expected_price_symbol": "ETH",
+                "fast_mode": False,
+            }
+
+            await bot.handle_callback({
+                "id": "cb1",
+                "data": "toggle_fast_mode",
+                "message": {"chat": {"id": 12345}, "message_id": 100},
+            })
+
+            assert bot._card_sessions[100]["fast_mode"] is True
+            assert bot._card_sessions[200]["fast_mode"] is False
+            rendered_text = bot.edit_message.call_args.args[2]
+            rendered_markup = bot.edit_message.call_args.kwargs["reply_markup"]["inline_keyboard"]
+            assert "FAST (Max Priority)" in rendered_text
+            assert any(btn.get("callback_data") == "toggle_fast_mode" and "ON" in btn.get("text", "") for row in rendered_markup for btn in row)
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
+    test_fast_gas_mode()
     test_fast_429_retry_and_zero_stagger()
     test_sequencer_excluded_from_chain_constants()
     test_safe_poll_receipt_and_dual_rpc()

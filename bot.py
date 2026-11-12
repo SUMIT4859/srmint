@@ -183,6 +183,7 @@ class TelegramBot:
                 "expected_price_wei": initial_stage.price_wei if initial_stage else 0,
                 "expected_price_unit": initial_stage.price_unit if initial_stage else 0.0,
                 "expected_price_symbol": initial_stage.price_symbol if initial_stage else "ETH",
+                "fast_mode": False,
             }
             self._card_sessions[msg_id] = card_state
             self._active_sessions[chat_id] = card_state
@@ -204,6 +205,7 @@ class TelegramBot:
         stage: DropStage = session["selected_stage"]
         qty: int = session["quantity"]
         wallets: list[WalletAccount] = session["selected_wallets"]
+        fast_mode: bool = bool(session.get("fast_mode", False))
 
         chain_info = get_chain_info(coll.chain_id)
         now = int(time.time())
@@ -310,6 +312,7 @@ class TelegramBot:
             f"🏷️ <b>Selected Stage:</b> {stage.label} ({stage.stage_type})\n"
             f"💰 <b>Mint Price:</b> {price_display}\n"
             f"🛡️ <b>Price Guard:</b> 🔒 Locked to {guard_label} (Auto-cancels if changed!)\n"
+            f"⛽ <b>Gas Mode:</b> {'⚡ <b>FAST (Max Priority)</b>' if fast_mode else '🟢 Normal'}\n"
             f"⏱️ <b>Status:</b> {status_text}\n"
             f"🔢 <b>Quantity per Wallet:</b> {qty}\n\n"
             f"👥 <b>Selected Wallets ({len(wallets)}/{len(all_configured_wallets)}):</b>\n"
@@ -371,6 +374,9 @@ class TelegramBot:
                 {"text": "🔘 Clear Selection", "callback_data": "wallet_deselect_all"},
             ])
 
+        fast_btn_text = "⚡ Fast Gas: ON (Max Fee)" if fast_mode else "⛽ Gas Mode: Normal (Tap for ⚡ Fast)"
+        buttons.append([{"text": fast_btn_text, "callback_data": "toggle_fast_mode"}])
+
         # Fire Button
         if len(wallets) == 0:
             fire_label = "⚠️ SELECT AT LEAST 1 WALLET"
@@ -401,6 +407,7 @@ class TelegramBot:
         stage: DropStage = session["selected_stage"]
         qty: int = session["quantity"]
         wallets: list[WalletAccount] = session["selected_wallets"]
+        fast_mode: bool = bool(session.get("fast_mode", False))
         expected_price_wei: int = session.get("expected_price_wei", stage.price_wei)
 
         if not wallets:
@@ -582,6 +589,7 @@ class TelegramBot:
                 quantity_per_wallet=qty,
                 wallet_quantities=wallet_quantities,
                 expected_price_wei=expected_price_wei,
+                fast_mode=fast_mode,
                 on_progress=on_progress,
             )
         except asyncio.CancelledError:
@@ -903,6 +911,10 @@ class TelegramBot:
         elif data == "qty_dec":
             if session:
                 session["quantity"] = max(session["quantity"] - 1, 1)
+                await self.render_mint_card(chat_id, msg_id)
+        elif data == "toggle_fast_mode":
+            if session:
+                session["fast_mode"] = not bool(session.get("fast_mode", False))
                 await self.render_mint_card(chat_id, msg_id)
         elif data.startswith("toggle_wallet_"):
             idx = int(data.split("_")[-1])

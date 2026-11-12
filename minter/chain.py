@@ -136,6 +136,7 @@ class ChainClient:
         self,
         fee_multiplier: float = 1.25,
         priority_fee_gwei: float = 0.002,
+        fast_mode: bool = False,
     ) -> GasFees:
         # Query latest block and fee history
         block_task = self.rpc_request("eth_getBlockByNumber", ["latest", False])
@@ -147,18 +148,30 @@ class ChainClient:
         if isinstance(block, dict) and "baseFeePerGas" in block and block["baseFeePerGas"]:
             base_fee = int(block["baseFeePerGas"], 16)
 
+        rpc_priority = 0
+        if isinstance(priority_res, str):
+            try:
+                rpc_priority = int(priority_res, 16)
+            except ValueError:
+                rpc_priority = 0
+
         priority_fee_wei = int(priority_fee_gwei * 1e9)
         chain_id = await self.get_chain_id()
-        if chain_id == 1:
+        effective_mult = fee_multiplier
+
+        if fast_mode:
+            if chain_id == 1:
+                effective_mult = max(fee_multiplier, 2.5)
+                max_priority = max(2_000_000_000, rpc_priority * 3, priority_fee_wei)
+            else:
+                effective_mult = max(fee_multiplier, 3.0)
+                raw_fast_tip = max(100_000_000, int(base_fee * 5), rpc_priority * 5)
+                max_priority = min(raw_fast_tip, 2_000_000_000)
+        elif chain_id == 1:
             # Ethereum Mainnet (L1): miner tip must not be sub-satoshi to prevent mempool stalling.
             min_eth_tip = 500_000_000  # 0.5 Gwei minimum tip
-            if isinstance(priority_res, str):
-                try:
-                    rpc_priority = int(priority_res, 16)
-                    if rpc_priority > 0:
-                        min_eth_tip = max(min_eth_tip, rpc_priority)
-                except ValueError:
-                    pass
+            if rpc_priority > 0:
+                min_eth_tip = max(min_eth_tip, rpc_priority)
             max_priority = max(min_eth_tip, priority_fee_wei)
         else:
             # On L2 chains (Robinhood Chain, Ink), base fee is only ~0.001-0.02 Gwei.
@@ -168,15 +181,10 @@ class ChainClient:
             else:
                 max_priority = max(100_000, priority_fee_wei)
 
-            if isinstance(priority_res, str):
-                try:
-                    rpc_priority = int(priority_res, 16)
-                    if 0 < rpc_priority <= base_fee:
-                        max_priority = max(max_priority, rpc_priority)
-                except ValueError:
-                    pass
+            if 0 < rpc_priority <= base_fee:
+                max_priority = max(max_priority, rpc_priority)
 
-        adjusted_base_fee = int(base_fee * fee_multiplier)
+        adjusted_base_fee = int(base_fee * effective_mult)
         max_fee = adjusted_base_fee + max_priority
 
         return GasFees(
