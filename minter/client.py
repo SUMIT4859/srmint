@@ -179,6 +179,7 @@ class MintAction:
     value: int
     calldata: bytes
     quantity: int = 1
+    attempts: int = 1
 
 
 @dataclass
@@ -700,11 +701,11 @@ class OpenSeaClient:
                     retry_after_hdr = resp.headers.get("retry-after")
                     if retry_after_hdr:
                         try:
-                            delay = max(0.2, float(retry_after_hdr) + random.uniform(0.02, 0.08))
+                            delay = min(1.0, max(0.05, float(retry_after_hdr)))
                         except ValueError:
-                            delay = 0.25 + random.uniform(0.02, 0.08)
+                            delay = 0.08 + random.uniform(0.01, 0.02)
                     else:
-                        delay = min(1.2, 0.15 * (1.3 ** attempt) + random.uniform(0.02, 0.08))
+                        delay = min(1.0, 0.06 * (1.4 ** attempt) + random.uniform(0.01, 0.02))
 
                     last_err = RuntimeError(f"OpenSea: Rate Limited (HTTP 429), backing off {delay:.2f}s")
                     if single_attempt:
@@ -716,7 +717,7 @@ class OpenSeaClient:
                     last_err = RuntimeError(f"OpenSea HTTP {resp.status_code}")
                     if single_attempt:
                         raise last_err
-                    delay = min(1.0, 0.15 * (1.2 ** attempt) + random.uniform(0.02, 0.06))
+                    delay = min(1.0, 0.06 * (1.3 ** attempt) + random.uniform(0.01, 0.02))
                     await asyncio.sleep(delay)
                     continue
 
@@ -728,7 +729,7 @@ class OpenSeaClient:
 
                     # GraphQL rate limit error
                     if "too many requests" in err_text.lower() or "rate limit" in err_text.lower() or "throttled" in err_text.lower():
-                        delay = min(1.2, 0.15 * (1.3 ** attempt) + random.uniform(0.02, 0.08))
+                        delay = min(1.0, 0.06 * (1.4 ** attempt) + random.uniform(0.01, 0.02))
                         last_err = RuntimeError(f"OpenSea: Rate Limited ({err_text}), backing off {delay:.2f}s")
                         if single_attempt:
                             raise last_err
@@ -755,7 +756,7 @@ class OpenSeaClient:
                                 val = int(val_raw)
                             calldata = bytes.fromhex(sub_data["data"].lstrip("0x"))
                             actual_qty = int(variables["toAssets"][0]["quantity"])
-                            return MintAction(target=target, value=val, calldata=calldata, quantity=actual_qty)
+                            return MintAction(target=target, value=val, calldata=calldata, quantity=actual_qty, attempts=attempt)
 
                     swap_errors = swap.get("errors", [])
                     if swap_errors:

@@ -200,20 +200,24 @@ class MintEngine:
             )
 
         try:
-            # 2. Check wallet balances
+            # 2. Check wallet balances and gas fees concurrently
             await notify("💰 Checking balances across all wallets...")
             addresses = [w.address for w in wallets]
-            balances = await active_chain.get_balances_batch(addresses)
-
-            # Query actual network gas fees to avoid inflated estimates
-            try:
-                current_gas = await active_chain.get_gas_fees(
+            bal_res, gas_res = await asyncio.gather(
+                active_chain.get_balances_batch(addresses),
+                active_chain.get_gas_fees(
                     fee_multiplier=self.config.fee_multiplier,
                     priority_fee_gwei=self.config.max_priority_fee_gwei,
-                )
-                max_fee = current_gas.max_fee_per_gas
-            except Exception:
+                ),
+                return_exceptions=True,
+            )
+            if isinstance(bal_res, Exception):
+                raise bal_res
+            balances = bal_res
+            if isinstance(gas_res, Exception):
                 max_fee = int(self.config.max_priority_fee_gwei * 1e9) + 500_000_000
+            else:
+                max_fee = gas_res.max_fee_per_gas
 
             estimated_gas_cost = min(self.config.gas_limit * max_fee, int(0.0005 * 1e18))
 
@@ -273,18 +277,25 @@ class MintEngine:
             # 4. T-10 Preparation & Pre-Signing Phase
             await notify("🚀 T-10s: Pre-fetching nonces & pre-signing transactions for all wallets...")
 
-            # Concurrently fetch nonces with concurrent drop collision protection
-            nonces = await NonceTracker.get_and_reserve_nonces(active_chain, chain_id, addresses)
-            nonces_reserved = True
-
-            # Fetch gas fees with boost multiplier
+            # Concurrently fetch nonces and gas fees with collision protection
             fee_mult = (
                 self.config.scheduled_fee_multiplier if is_scheduled else self.config.fee_multiplier
             )
-            gas_fees = await active_chain.get_gas_fees(
-                fee_multiplier=fee_mult,
-                priority_fee_gwei=self.config.max_priority_fee_gwei,
+            nonces_res, gas_res = await asyncio.gather(
+                NonceTracker.get_and_reserve_nonces(active_chain, chain_id, addresses),
+                active_chain.get_gas_fees(
+                    fee_multiplier=fee_mult,
+                    priority_fee_gwei=self.config.max_priority_fee_gwei,
+                ),
+                return_exceptions=True,
             )
+            if isinstance(nonces_res, Exception):
+                raise nonces_res
+            nonces = nonces_res
+            nonces_reserved = True
+            if isinstance(gas_res, Exception):
+                raise gas_res
+            gas_fees = gas_res
 
             # Prepare transactions
             prepared_tx_map: dict[str, bytes] = {}
@@ -430,48 +441,30 @@ class MintEngine:
                 target_broadcast_time = target_start_ts - lead_seconds
 
                 rem = target_broadcast_time - time.time()
-                # If countdown is long enough, sleep until T-2.0s then pulse warm RPC sockets and OpenSea GraphQL session
-                if rem > 2.5:
-                    await asyncio.sleep(rem - 2.0)
-                    # Warmup both primary and fallback RPC connections and OpenSea GraphQL sockets so TCP/TLS handshakes are hot!
+                # Pulse warm RPC + OpenSea HTTP/2 sockets once at T-2.5s so TLS/TCP streams stay hot (120s keepalive)
+                # while leaving >2s before T-0 so OpenSea's per-second rate-limit window is 100% fresh!
+                if rem > 2.8:
+                    await asyncio.sleep(rem - 2.5)
                     try:
-                        tasks = [active_chain.rpc_request("eth_blockNumber", [])]
-                        if active_chain.fallback_rpc_url and active_chain.fallback_rpc_url != active_chain.rpc_url:
-                            tasks.append(active_chain.rpc_request("eth_blockNumber", [], use_fallback=True))
-                        # Warm OpenSea GraphQL client socket
                         os_cl = await self.opensea.get_client()
-                        tasks.append(os_cl.post(
-                            GRAPHQL_URL,
-                            json={"query": "query KeepWarm { __typename }", "variables": {}},
-                            headers=self.opensea._get_headers(slug=collection.slug),
-                        ))
-                        for w in wallets:
-                            w_cl = await self.opensea.get_wallet_client(w.address)
-                            tasks.append(w_cl.post(
+                        w_clients = [await self.opensea.get_wallet_client(w.address) for w in wallets]
+                        warm_coros = [
+                            active_chain.rpc_request("eth_blockNumber", []),
+                            os_cl.post(
                                 GRAPHQL_URL,
                                 json={"query": "query KeepWarm { __typename }", "variables": {}},
-                                headers=self.opensea._get_headers(w.address, slug=collection.slug),
-                            ))
-                        await asyncio.gather(*tasks, return_exceptions=True)
-                    except Exception:
-                        pass
-
-                # Second hot pulse right at T-0.7s to keep TLS stream boiling hot into T-0
-                rem_warm2 = target_broadcast_time - time.time()
-                if rem_warm2 > 0.8:
-                    await asyncio.sleep(rem_warm2 - 0.7)
-                    try:
-                        tasks = [active_chain.rpc_request("eth_blockNumber", [])]
+                                headers=self.opensea._get_headers(slug=collection.slug),
+                            ),
+                        ]
                         if active_chain.fallback_rpc_url and active_chain.fallback_rpc_url != active_chain.rpc_url:
-                            tasks.append(active_chain.rpc_request("eth_blockNumber", [], use_fallback=True))
-                        for w in wallets:
-                            w_cl = await self.opensea.get_wallet_client(w.address)
-                            tasks.append(w_cl.post(
+                            warm_coros.append(active_chain.rpc_request("eth_blockNumber", [], use_fallback=True))
+                        for w, w_cl in zip(wallets, w_clients):
+                            warm_coros.append(w_cl.post(
                                 GRAPHQL_URL,
                                 json={"query": "query KeepWarm { __typename }", "variables": {}},
                                 headers=self.opensea._get_headers(w.address, slug=collection.slug),
                             ))
-                        await asyncio.gather(*tasks, return_exceptions=True)
+                        await asyncio.gather(*warm_coros, return_exceptions=True)
                     except Exception:
                         pass
 
@@ -505,6 +498,7 @@ class MintEngine:
                 try:
                     await active_chain.broadcast_raw_transaction(raw_bytes)
                     r.broadcast_time_ms = int((time.time() - t0) * 1000)
+                    print(f"[T-0] {r.wallet.label}: PreSigned | RPC={r.broadcast_time_ms}ms")
                 except Exception as ex:
                     r.status = "FAILED"
                     r.error_message = f"Broadcast failed: {ex}"
@@ -514,10 +508,6 @@ class MintEngine:
             async def pipeline_wallet(idx: int, w: WalletAccount) -> None:
                 r = next(res for res in results if res.wallet.address == w.address)
                 w_qty = wallet_quantities.get(w.address, quantity_per_wallet)
-
-                # Micro-stagger (2ms) across wallets to distribute initial socket bursts cleanly
-                if idx > 0:
-                    await asyncio.sleep(idx * 0.002)
 
                 t_call_start = time.time()
                 async with pipeline_sem:
@@ -538,6 +528,7 @@ class MintEngine:
                         r.calldata_time_ms = int((time.time() - t_call_start) * 1000)
                         r.status = "FAILED"
                         r.error_message = str(ex)
+                        print(f"[T-0] {w.label}: OS FAILED ({r.calldata_time_ms}ms) -> {ex}")
                         return
 
                 # Safety Net: Price Guard checks per-wallet
@@ -572,6 +563,10 @@ class MintEngine:
                 try:
                     await active_chain.broadcast_raw_transaction(raw_bytes)
                     r.broadcast_time_ms = int((time.time() - t0) * 1000)
+                    print(
+                        f"[T-0] {w.label}: OS={r.calldata_time_ms}ms "
+                        f"(tries={getattr(act, 'attempts', 1)}) | RPC={r.broadcast_time_ms}ms"
+                    )
                 except Exception as ex:
                     r.status = "FAILED"
                     r.error_message = f"Broadcast failed: {ex}"

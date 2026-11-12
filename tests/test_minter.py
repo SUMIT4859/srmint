@@ -1540,7 +1540,66 @@ def test_safe_poll_receipt_and_dual_rpc():
     asyncio.run(run_wait_test())
 
 
+def test_fast_429_retry_and_zero_stagger():
+    from minter.client import OpenSeaClient, CollectionInfo, DropStage
+    from minter.wallet import WalletAccount
+
+    client = OpenSeaClient()
+    wallet = WalletAccount("0x0000000000000000000000000000000000000000000000000000000000000001")
+    coll = CollectionInfo(
+        name="FastTest", slug="fast-test", contract_address="0x" + "1" * 40,
+        image_url="", chain_identifier="ROBINHOOD", chain_id=4663, total_supply=10, max_supply=100, stages=[],
+    )
+    stage = DropStage(
+        uuid="s1", label="Allowlist", stage_type="PRIVATE_SALE", stage_index=0,
+        start_time="", end_time="", start_timestamp=int(time.time() - 10), end_timestamp=int(time.time() + 100),
+        max_per_wallet=1, price_wei=0, price_symbol="ETH", price_unit=0.0,
+    )
+
+    calls = {"n": 0}
+    async def mock_post(url, json=None, headers=None):
+        calls["n"] += 1
+        resp = MagicMock()
+        if calls["n"] == 1:
+            resp.status_code = 429
+            resp.headers = {}
+            return resp
+        resp.status_code = 200
+        resp.headers = {}
+        resp.json = lambda: {
+            "data": {
+                "swap": {
+                    "actions": [{
+                        "transactionSubmissionData": {
+                            "to": "0x" + "2" * 40,
+                            "data": "0xdeadbeef",
+                            "value": "0",
+                        }
+                    }],
+                    "errors": [],
+                }
+            }
+        }
+        return resp
+
+    mock_http = AsyncMock()
+    mock_http.is_closed = False
+    mock_http.post = mock_post
+    client._wallet_clients[wallet.address.lower()] = mock_http
+
+    async def run_test():
+        t0 = time.time()
+        act = await client.get_mint_action_hot(coll, wallet, 1, stage, max_attempts=3)
+        elapsed = time.time() - t0
+        assert act.attempts == 2
+        assert act.calldata == b"\xde\xad\xbe\xef"
+        assert elapsed < 0.25, f"Fast 429 retry should be <0.25s, took {elapsed:.3f}s"
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
+    test_fast_429_retry_and_zero_stagger()
     test_sequencer_excluded_from_chain_constants()
     test_safe_poll_receipt_and_dual_rpc()
     test_wallet_account()

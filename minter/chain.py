@@ -46,7 +46,7 @@ class ChainClient:
         if self._client is None or self._client.is_closed:
             self._client = httpx.AsyncClient(
                 timeout=self.timeout_seconds,
-                limits=httpx.Limits(max_connections=50, max_keepalive_connections=50, keepalive_expiry=60.0),
+                limits=httpx.Limits(max_connections=100, max_keepalive_connections=100, keepalive_expiry=60.0),
                 http2=True,
             )
         return self._client
@@ -80,8 +80,8 @@ class ChainClient:
                 raise RuntimeError(f"RPC Error [{method}]: {msg}")
             return data.get("result")
         except Exception as e:
-            # Try fallback once if available
-            if not use_fallback and self.fallback_rpc_url:
+            # Try fallback once if distinct fallback endpoint is configured
+            if not use_fallback and self.fallback_rpc_url and self.fallback_rpc_url != self.rpc_url:
                 return await self.rpc_request(method, params, use_fallback=True)
             raise e
 
