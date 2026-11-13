@@ -106,8 +106,11 @@ class TelegramBot:
             payload["reply_markup"] = reply_markup
         await self.send_request("editMessageText", payload)
 
-    async def answer_callback(self, callback_id: str, text: str = "") -> None:
-        await self.send_request("answerCallbackQuery", {"callback_query_id": callback_id, "text": text})
+    async def answer_callback(self, callback_id: str, text: str = "", show_alert: bool = False) -> None:
+        payload: dict[str, Any] = {"callback_query_id": callback_id, "text": text}
+        if show_alert:
+            payload["show_alert"] = True
+        await self.send_request("answerCallbackQuery", payload)
 
     async def delete_message(self, chat_id: int, message_id: int) -> None:
         await self.send_request("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
@@ -184,6 +187,7 @@ class TelegramBot:
                 "expected_price_unit": initial_stage.price_unit if initial_stage else 0.0,
                 "expected_price_symbol": initial_stage.price_symbol if initial_stage else "ETH",
                 "fast_mode": False,
+                "custom_gas_usd": 0.0,
             }
             self._card_sessions[msg_id] = card_state
             self._active_sessions[chat_id] = card_state
@@ -206,6 +210,7 @@ class TelegramBot:
         qty: int = session["quantity"]
         wallets: list[WalletAccount] = session["selected_wallets"]
         fast_mode: bool = bool(session.get("fast_mode", False))
+        custom_gas_usd: float = float(session.get("custom_gas_usd", 0.0))
 
         chain_info = get_chain_info(coll.chain_id)
         now = int(time.time())
@@ -312,7 +317,7 @@ class TelegramBot:
             f"🏷️ <b>Selected Stage:</b> {stage.label} ({stage.stage_type})\n"
             f"💰 <b>Mint Price:</b> {price_display}\n"
             f"🛡️ <b>Price Guard:</b> 🔒 Locked to {guard_label} (Auto-cancels if changed!)\n"
-            f"⛽ <b>Gas Mode:</b> {'⚡ <b>FAST (Max Priority)</b>' if fast_mode else '🟢 Normal'}\n"
+            f"⛽ <b>Gas Mode:</b> {'🔥 <b>GAS WAR ($' + f'{custom_gas_usd:.2f})</b>' if custom_gas_usd > 0 else ('⚡ <b>FAST (Max Priority)</b>' if fast_mode else '🟢 Normal')}\n"
             f"⏱️ <b>Status:</b> {status_text}\n"
             f"🔢 <b>Quantity per Wallet:</b> {qty}\n\n"
             f"👥 <b>Selected Wallets ({len(wallets)}/{len(all_configured_wallets)}):</b>\n"
@@ -374,8 +379,17 @@ class TelegramBot:
                 {"text": "🔘 Clear Selection", "callback_data": "wallet_deselect_all"},
             ])
 
-        fast_btn_text = "⚡ Fast Gas: ON (Max Fee)" if fast_mode else "⛽ Gas Mode: Normal (Tap for ⚡ Fast)"
-        buttons.append([{"text": fast_btn_text, "callback_data": "toggle_fast_mode"}])
+        if custom_gas_usd > 0:
+            gas_btn_text = f"🔥 Gas: WAR (${custom_gas_usd:.2f})"
+        elif fast_mode:
+            gas_btn_text = "⚡ Gas: FAST (Max Priority)"
+        else:
+            gas_btn_text = "⛽ Gas: Normal (Tap to Change)"
+
+        buttons.append([
+            {"text": gas_btn_text, "callback_data": "cycle_gas_mode"},
+            {"text": "💵 Set Custom $", "callback_data": "prompt_custom_gas"},
+        ])
 
         # Fire Button
         if len(wallets) == 0:
@@ -408,6 +422,7 @@ class TelegramBot:
         qty: int = session["quantity"]
         wallets: list[WalletAccount] = session["selected_wallets"]
         fast_mode: bool = bool(session.get("fast_mode", False))
+        custom_gas_usd: float = float(session.get("custom_gas_usd", 0.0))
         expected_price_wei: int = session.get("expected_price_wei", stage.price_wei)
 
         if not wallets:
@@ -590,6 +605,7 @@ class TelegramBot:
                 wallet_quantities=wallet_quantities,
                 expected_price_wei=expected_price_wei,
                 fast_mode=fast_mode,
+                custom_gas_usd=custom_gas_usd,
                 on_progress=on_progress,
             )
         except asyncio.CancelledError:
@@ -912,10 +928,33 @@ class TelegramBot:
             if session:
                 session["quantity"] = max(session["quantity"] - 1, 1)
                 await self.render_mint_card(chat_id, msg_id)
-        elif data == "toggle_fast_mode":
+        elif data in ("cycle_gas_mode", "toggle_fast_mode"):
             if session:
-                session["fast_mode"] = not bool(session.get("fast_mode", False))
+                curr_fast = bool(session.get("fast_mode", False))
+                curr_custom = float(session.get("custom_gas_usd", 0.0))
+                # Cycle: Normal -> Fast -> War $0.50 -> War $1.00 -> War $2.00 -> Normal
+                if not curr_fast and curr_custom == 0.0:
+                    session["fast_mode"] = True
+                    session["custom_gas_usd"] = 0.0
+                elif curr_fast and curr_custom == 0.0:
+                    session["fast_mode"] = False
+                    session["custom_gas_usd"] = 0.50
+                elif curr_custom == 0.50:
+                    session["fast_mode"] = False
+                    session["custom_gas_usd"] = 1.00
+                elif curr_custom == 1.00:
+                    session["fast_mode"] = False
+                    session["custom_gas_usd"] = 2.00
+                else:
+                    session["fast_mode"] = False
+                    session["custom_gas_usd"] = 0.0
                 await self.render_mint_card(chat_id, msg_id)
+        elif data == "prompt_custom_gas":
+            await self.answer_callback(
+                cb_id,
+                text="💡 To set exact custom $ max gas, send: /gas <amount> (e.g. /gas 0.75 or /gas 2.50). Send /gas 0 to reset.",
+                show_alert=True,
+            )
         elif data.startswith("toggle_wallet_"):
             idx = int(data.split("_")[-1])
             if session:
@@ -1071,6 +1110,43 @@ class TelegramBot:
 
         elif text == "/wallets":
             await self.handle_wallets_menu(chat_id)
+
+        elif text.startswith("/gas"):
+            parts = text.split()
+            if len(parts) >= 2:
+                try:
+                    val = float(parts[1].replace("$", "").strip())
+                    active_s = self._active_sessions.get(chat_id)
+                    if active_s:
+                        if val > 0:
+                            active_s["custom_gas_usd"] = val
+                            active_s["fast_mode"] = False
+                            await self.send_message(
+                                chat_id,
+                                f"🔥 <b>Gas War Set:</b> Max ${val:.2f} budget locked for this drop!",
+                            )
+                        else:
+                            active_s["custom_gas_usd"] = 0.0
+                            active_s["fast_mode"] = False
+                            await self.send_message(chat_id, "🟢 <b>Gas Mode Reset to Normal.</b>")
+                        msg_id = active_s.get("message_id")
+                        if msg_id:
+                            await self.render_mint_card(chat_id, msg_id)
+                    else:
+                        await self.send_message(
+                            chat_id,
+                            "ℹ️ No active mint card found. First run <code>/mint &lt;url&gt;</code> to open a card, then set /gas!",
+                        )
+                except ValueError:
+                    await self.send_message(
+                        chat_id,
+                        "Usage: <code>/gas &lt;usd_amount&gt;</code>\nExample: <code>/gas 0.50</code> or <code>/gas 2.00</code>",
+                    )
+            else:
+                await self.send_message(
+                    chat_id,
+                    "Usage: <code>/gas &lt;usd_amount&gt;</code>\nExample: <code>/gas 0.50</code>, <code>/gas 1.50</code> (or <code>/gas 0</code> to reset to Normal)",
+                )
 
         elif text.startswith("/addwallet"):
             # Delete the incoming message with private key immediately for security!

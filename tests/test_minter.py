@@ -1661,7 +1661,7 @@ def test_fast_gas_mode():
         mock_chain.get_balances_batch = AsyncMock(return_value={wallet.address: int(1e18)})
         mock_chain.get_nonces_batch = AsyncMock(return_value={wallet.address: 0})
 
-        async def mock_get_gas_fees(fee_multiplier=1.25, priority_fee_gwei=0.002, fast_mode=False):
+        async def mock_get_gas_fees(fee_multiplier=1.25, priority_fee_gwei=0.002, fast_mode=False, **kwargs):
             seen_fast_flags.append(bool(fast_mode))
             if fast_mode:
                 return GasFees(20_000_000, 100_000_000, 160_000_000)
@@ -1723,7 +1723,7 @@ def test_fast_gas_mode():
             rendered_text = bot.edit_message.call_args.args[2]
             rendered_markup = bot.edit_message.call_args.kwargs["reply_markup"]["inline_keyboard"]
             assert "FAST (Max Priority)" in rendered_text
-            assert any(btn.get("callback_data") == "toggle_fast_mode" and "ON" in btn.get("text", "") for row in rendered_markup for btn in row)
+            assert any(btn.get("callback_data") in ("cycle_gas_mode", "toggle_fast_mode") and "FAST" in btn.get("text", "") for row in rendered_markup for btn in row)
 
     asyncio.run(run_test())
 
@@ -1908,7 +1908,146 @@ def test_revert_diagnosis_and_t0_timing():
     asyncio.run(run_test())
 
 
+def test_custom_gas_war_mode():
+    """Verify Custom Gas War ($) converts Dollar budget to aggressive priority tip, respects ceiling, cycles cleanly in bot, and supports /gas command."""
+    from bot import TelegramBot
+    from minter.chain import ChainClient, GasFees
+    from minter.client import CollectionInfo, DropStage, MintAction
+    from minter.engine import MintEngine, NonceTracker
+    from minter.wallet import WalletAccount, WalletManager
+
+    NonceTracker.reset()
+
+    async def run_test():
+        # 1. Test ChainClient.get_gas_fees with custom_gas_usd on Robinhood Chain (L2) and Ethereum (L1)
+        cc = ChainClient("https://rpc.example.com")
+        cc.get_chain_id = AsyncMock(return_value=4663)
+        cc.get_eth_price_usd = AsyncMock(return_value=2500.0)
+
+        async def fake_rpc(method: str, params=None):
+            if method == "eth_getBlockByNumber":
+                return {"baseFeePerGas": hex(20_000_000)}  # 0.02 Gwei
+            if method == "eth_maxPriorityFeePerGas":
+                return hex(1_000_000)  # 0.001 Gwei
+            return None
+
+        cc.rpc_request = fake_rpc
+
+        # $0.50 budget @ $2500 ETH / 150k gas:
+        # budget_wei = (0.50 / 2500) * 1e18 = 200_000_000_000_000 wei
+        # target_max_fee = 200_000_000_000_000 // 150_000 = 1,333,333,333 wei (~1.33 Gwei)
+        # headroom = 2 * 20_000_000 = 40_000_000 wei (~0.04 Gwei)
+        # max_priority = 1,333,333,333 - 40_000_000 = 1,293,333,333 wei (~1.29 Gwei)
+        fees_50c = await cc.get_gas_fees(custom_gas_usd=0.50)
+        assert fees_50c.max_priority_fee_per_gas > 1_000_000_000, f"Expected >1 Gwei aggressive tip, got {fees_50c.max_priority_fee_per_gas}"
+        assert fees_50c.max_fee_per_gas > fees_50c.max_priority_fee_per_gas
+        # Assert total 150k gas cost strictly stays <= $0.50 USD
+        cost_usd_50c = (fees_50c.max_fee_per_gas * 150_000 / 1e18) * 2500.0
+        assert cost_usd_50c <= 0.51
+
+        # $1.00 budget
+        fees_1usd = await cc.get_gas_fees(custom_gas_usd=1.00)
+        assert fees_1usd.max_fee_per_gas > fees_50c.max_fee_per_gas
+        assert fees_1usd.max_priority_fee_per_gas > fees_50c.max_priority_fee_per_gas
+        cost_usd_1usd = (fees_1usd.max_fee_per_gas * 150_000 / 1e18) * 2500.0
+        assert cost_usd_1usd <= 1.01
+
+        # 2. Test MintEngine.execute_mint forwards custom_gas_usd cleanly
+        cfg = AppConfig()
+        cfg.broadcast_lead_ms = 0
+        wallet = WalletAccount("0x" + "a" * 64, label="W1")
+        coll = CollectionInfo(
+            name="WarDrop", slug="war-drop", contract_address="0x" + "1" * 40,
+            image_url="", chain_identifier="robinhood", chain_id=4663, total_supply=10, max_supply=100, stages=[],
+        )
+        stage = DropStage(
+            uuid="s1", label="Public", stage_type="PUBLIC_SALE", stage_index=0,
+            start_time="", end_time="", start_timestamp=int(time.time()) - 10, end_timestamp=int(time.time()) + 300,
+            max_per_wallet=1, price_wei=0, price_symbol="ETH", price_unit=0.0,
+        )
+
+        seen_custom_gas: list[float] = []
+        mock_chain = MagicMock()
+        mock_chain.rpc_url = "https://rpc.robinhood.org"
+        mock_chain.fallback_rpc_url = ""
+        mock_chain.timeout_seconds = 5.0
+        mock_chain.get_chain_id = AsyncMock(return_value=4663)
+        mock_chain.get_balances_batch = AsyncMock(return_value={wallet.address: int(1e18)})
+        mock_chain.get_nonces_batch = AsyncMock(return_value={wallet.address: 0})
+
+        async def mock_gas_fees(**kwargs):
+            seen_custom_gas.append(kwargs.get("custom_gas_usd", 0.0))
+            return GasFees(20_000_000, 1_290_000_000, 1_330_000_000)
+
+        mock_chain.get_gas_fees = AsyncMock(side_effect=mock_gas_fees)
+        mock_chain.broadcast_raw_transaction = AsyncMock(return_value="0x" + "f" * 64)
+        mock_chain.wait_for_receipt = AsyncMock(return_value=MagicMock(status=1, gas_used=135000))
+
+        mock_opensea = MagicMock()
+        mock_opensea.start_heartbeat = MagicMock()
+        mock_opensea.stop_heartbeat = MagicMock()
+
+        engine = MintEngine(cfg, mock_chain, mock_opensea)
+        res = await engine.execute_mint(coll, stage, [wallet], quantity_per_wallet=1, custom_gas_usd=0.50)
+        assert res[0].status == "SUCCESS"
+        assert len(seen_custom_gas) >= 1 and all(cg == 0.50 for cg in seen_custom_gas)
+
+        # 3. Test TelegramBot: cycling gas mode & /gas command
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            w_mgr = WalletManager(str(Path(tmp_dir) / "wallets.json"))
+            w = w_mgr.add_wallet("0x" + "a" * 64, label="W1")
+            bot = TelegramBot(cfg, w_mgr)
+            bot.answer_callback = AsyncMock()
+            bot.edit_message = AsyncMock()
+            bot.send_message = AsyncMock()
+
+            # Session defaults to Normal mode (fast_mode=False, custom_gas_usd=0.0)
+            bot._card_sessions[100] = {
+                "message_id": 100, "chat_id": 12345, "collection": coll,
+                "selected_stage": stage, "quantity": 1, "selected_wallets": [w],
+                "expected_price_wei": 0, "expected_price_unit": 0.0, "expected_price_symbol": "ETH",
+                "fast_mode": False, "custom_gas_usd": 0.0,
+            }
+            bot._active_sessions[12345] = bot._card_sessions[100]
+
+            # Tap 1: Normal -> Fast
+            await bot.handle_callback({"id": "cb1", "data": "cycle_gas_mode", "message": {"chat": {"id": 12345}, "message_id": 100}})
+            assert bot._card_sessions[100]["fast_mode"] is True
+            assert bot._card_sessions[100]["custom_gas_usd"] == 0.0
+
+            # Tap 2: Fast -> War ($0.50)
+            await bot.handle_callback({"id": "cb2", "data": "cycle_gas_mode", "message": {"chat": {"id": 12345}, "message_id": 100}})
+            assert bot._card_sessions[100]["fast_mode"] is False
+            assert bot._card_sessions[100]["custom_gas_usd"] == 0.50
+
+            # Tap 3: War ($0.50) -> War ($1.00)
+            await bot.handle_callback({"id": "cb3", "data": "cycle_gas_mode", "message": {"chat": {"id": 12345}, "message_id": 100}})
+            assert bot._card_sessions[100]["custom_gas_usd"] == 1.00
+
+            # Tap 4: War ($1.00) -> War ($2.00)
+            await bot.handle_callback({"id": "cb4", "data": "cycle_gas_mode", "message": {"chat": {"id": 12345}, "message_id": 100}})
+            assert bot._card_sessions[100]["custom_gas_usd"] == 2.00
+
+            # Tap 5: War ($2.00) -> Normal
+            await bot.handle_callback({"id": "cb5", "data": "cycle_gas_mode", "message": {"chat": {"id": 12345}, "message_id": 100}})
+            assert bot._card_sessions[100]["fast_mode"] is False
+            assert bot._card_sessions[100]["custom_gas_usd"] == 0.0
+
+            # Test /gas command: /gas 1.75
+            await bot.handle_message({"chat": {"id": 12345}, "text": "/gas 1.75", "message_id": 201})
+            assert bot._card_sessions[100]["custom_gas_usd"] == 1.75
+            assert bot._card_sessions[100]["fast_mode"] is False
+
+            # Test /gas 0 resets to normal
+            await bot.handle_message({"chat": {"id": 12345}, "text": "/gas 0", "message_id": 202})
+            assert bot._card_sessions[100]["custom_gas_usd"] == 0.0
+            assert bot._card_sessions[100]["fast_mode"] is False
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
+    test_custom_gas_war_mode()
     test_hybrid_rest_and_gql_mint_race()
     test_revert_diagnosis_and_t0_timing()
     test_fast_gas_mode()

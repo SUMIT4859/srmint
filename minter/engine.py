@@ -129,6 +129,7 @@ class MintEngine:
         wallet_quantities: dict[str, int] | None = None,
         expected_price_wei: int | None = None,
         fast_mode: bool = False,
+        custom_gas_usd: float = 0.0,
         on_progress: Callable[[str], asyncio.Future[Any] | Any] | None = None,
     ) -> list[WalletMintResult]:
         self._cancel_requested = False
@@ -181,7 +182,12 @@ class MintEngine:
         now = int(time.time())
         is_scheduled = stage.start_timestamp > now
 
-        gas_badge = " | Gas: ⚡ FAST" if fast_mode else ""
+        if custom_gas_usd > 0:
+            gas_badge = f" | Gas: 🔥 WAR (${custom_gas_usd:.2f})"
+        elif fast_mode:
+            gas_badge = " | Gas: ⚡ FAST"
+        else:
+            gas_badge = ""
         await notify(
             f"⚡ Initializing {'Public' if is_public else 'Allowlist'} Mint for {len(wallets)} wallet(s)...\n"
             f"Collection: <b>{collection.name}</b>\n"
@@ -211,6 +217,7 @@ class MintEngine:
                     fee_multiplier=self.config.fee_multiplier,
                     priority_fee_gwei=self.config.max_priority_fee_gwei,
                     fast_mode=fast_mode,
+                    custom_gas_usd=custom_gas_usd,
                 ),
                 return_exceptions=True,
             )
@@ -222,7 +229,13 @@ class MintEngine:
             else:
                 max_fee = gas_res.max_fee_per_gas
 
-            estimated_gas_cost = min(self.config.gas_limit * max_fee, int(0.0005 * 1e18))
+            if custom_gas_usd > 0:
+                estimated_gas_cost = min(
+                    self.config.gas_limit * max_fee,
+                    max(int(0.0005 * 1e18), int((custom_gas_usd / 2500.0) * 1e18)),
+                )
+            else:
+                estimated_gas_cost = min(self.config.gas_limit * max_fee, int(0.0005 * 1e18))
 
             for res in results:
                 w_qty = wallet_quantities.get(res.wallet.address, quantity_per_wallet)
@@ -290,6 +303,7 @@ class MintEngine:
                     fee_multiplier=fee_mult,
                     priority_fee_gwei=self.config.max_priority_fee_gwei,
                     fast_mode=fast_mode,
+                    custom_gas_usd=custom_gas_usd,
                 ),
                 return_exceptions=True,
             )

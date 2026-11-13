@@ -41,6 +41,7 @@ class ChainClient:
         self.timeout_seconds = timeout_seconds
         self._client: httpx.AsyncClient | None = None
         self._chain_id: int | None = None
+        self._eth_price_cache: tuple[float, float] = (0.0, 0.0)  # (price_usd, cached_at_timestamp)
 
     async def get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
@@ -132,11 +133,48 @@ class ChainClient:
                 raise RuntimeError(f"Failed to fetch nonce for {addr}: {r}")
         return res_dict
 
+    async def get_eth_price_usd(self) -> float:
+        """Fetch live ETH/USD spot price with 60s memory cache and safe offline fallback."""
+        now = time.time()
+        cached_price, cached_time = self._eth_price_cache
+        if cached_price > 0 and (now - cached_time) < 60.0:
+            return cached_price
+
+        # Fast public spot price from Coinbase (~30ms)
+        try:
+            client = await self.get_client()
+            resp = await client.get("https://api.coinbase.com/v2/prices/ETH-USD/spot", timeout=2.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                price = float(data.get("data", {}).get("amount", 0))
+                if price > 0:
+                    self._eth_price_cache = (price, now)
+                    return price
+        except Exception:
+            pass
+
+        # Fallback to Binance
+        try:
+            client = await self.get_client()
+            resp = await client.get("https://api.binance.com/api/v3/ticker/price?symbol=ETHUSDT", timeout=2.0)
+            if resp.status_code == 200:
+                data = resp.json()
+                price = float(data.get("price", 0))
+                if price > 0:
+                    self._eth_price_cache = (price, now)
+                    return price
+        except Exception:
+            pass
+
+        # Safe fallback so gas calculation NEVER breaks or delays
+        return 2600.0
+
     async def get_gas_fees(
         self,
         fee_multiplier: float = 1.25,
         priority_fee_gwei: float = 0.002,
         fast_mode: bool = False,
+        custom_gas_usd: float = 0.0,
     ) -> GasFees:
         # Query latest block and fee history
         block_task = self.rpc_request("eth_getBlockByNumber", ["latest", False])
@@ -157,8 +195,36 @@ class ChainClient:
 
         priority_fee_wei = int(priority_fee_gwei * 1e9)
         chain_id = await self.get_chain_id()
-        effective_mult = fee_multiplier
 
+        # Custom Dollar Gas War Mode ($): Calculate aggressive priority fee within user's exact $ budget
+        if custom_gas_usd > 0:
+            eth_price = await self.get_eth_price_usd()
+            est_gas = 150_000
+            total_budget_wei = int((custom_gas_usd / eth_price) * 1e18)
+            target_max_fee = max(total_budget_wei // est_gas, int(base_fee * 1.25))
+
+            if chain_id == 1:
+                headroom = int(base_fee * 1.5)
+                if target_max_fee > headroom:
+                    max_priority = max(500_000_000, target_max_fee - headroom)
+                else:
+                    max_priority = max(500_000_000, rpc_priority)
+                    target_max_fee = headroom + max_priority
+            else:
+                headroom = int(base_fee * 2.0)
+                if target_max_fee > headroom:
+                    max_priority = target_max_fee - headroom
+                else:
+                    max_priority = max(100_000, int(base_fee * 0.1))
+                    target_max_fee = headroom + max_priority
+
+            return GasFees(
+                base_fee_per_gas=base_fee,
+                max_priority_fee_per_gas=max_priority,
+                max_fee_per_gas=target_max_fee,
+            )
+
+        effective_mult = fee_multiplier
         if fast_mode:
             if chain_id == 1:
                 effective_mult = max(fee_multiplier, 2.5)
