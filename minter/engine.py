@@ -174,7 +174,9 @@ class MintEngine:
                 active_chain = ChainClient(
                     target_rpc,
                     fallback_rpc_url=target_fallback,
+                    sequencer_url=self.chain.sequencer_url,
                     timeout_seconds=self.chain.timeout_seconds,
+                    extra_rpcs=self.config.extra_broadcast_rpcs,
                 )
                 should_close_active_chain = True
 
@@ -465,8 +467,8 @@ class MintEngine:
                 needs_os_at_t0 = len(wallets_needing_t0) > 0
                 cfg_lead = max(0.0, self.config.broadcast_lead_ms / 1000.0)
                 if needs_os_at_t0:
-                    # OpenSea unlocks allowlist calldata at T-0; do NOT fire 120ms early and waste a failed RTT
-                    lead_seconds = min(cfg_lead, 0.005)
+                    # OpenSea unlocks allowlist calldata at T-0; 12ms lead starts network in-flight at exact boundary
+                    lead_seconds = min(cfg_lead, 0.012)
                 else:
                     # Direct SeaDrop / pre-signed: small 30ms lead beats T-0 without landing in a T-1s block
                     lead_seconds = min(cfg_lead, 0.030)

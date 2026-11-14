@@ -149,9 +149,9 @@ SEADROP_ERROR_SELECTORS = {
     "0xf477d26f": "FeeRecipientNotAllowed (Wrong fee recipient)",
     "0x5136e8d5": "FeeRecipientCannotBeZeroAddress",
     "0x3a4b9534": "MintQuantityCannotBeZero",
-    "0x6d0426f8": "MintQuantityExceedsMaxMintedPerWallet (Already minted maximum)",
-    "0x3a824151": "MintQuantityExceedsMaxSupply (Drop sold out)",
-    "0xd415a9ab": "NotActive (Drop stage not active)",
+    "0x6d0426f8": "MintQuantityExceedsMaxMintedPerWallet (Wallet Limit Reached)",
+    "0x3a824151": "MintQuantityExceedsMaxSupply (Drop sold out - Supply exhausted)",
+    "0xd415a9ab": "NotActive (Drop stage not active yet or already ended)",
     "0x61f95304": "IncorrectPayment (Price mismatch)",
     "0xe651581a": "CreatorPaymentMethodNotAllowed",
 }
@@ -164,4 +164,6 @@ def decode_seadrop_error(error_hex: str) -> str:
     for sel, name in SEADROP_ERROR_SELECTORS.items():
         if sel in err_lower:
             return name
+    if any(k in err_lower for k in ("exceeds max supply", "drop sold out", "sold out", "max supply")):
+        return "MintQuantityExceedsMaxSupply (Drop 100% Sold Out / Supply Exhausted)"
     return ""

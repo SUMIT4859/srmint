@@ -34,11 +34,13 @@ class ChainClient:
         fallback_rpc_url: str = "",
         sequencer_url: str = "",
         timeout_seconds: float = 8.0,
+        extra_rpcs: list[str] | None = None,
     ) -> None:
         self.rpc_url = rpc_url
         self.fallback_rpc_url = fallback_rpc_url
         self.sequencer_url = sequencer_url
         self.timeout_seconds = timeout_seconds
+        self.extra_rpcs = [r for r in (extra_rpcs or []) if r]
         self._client: httpx.AsyncClient | None = None
         self._chain_id: int | None = None
         self._eth_price_cache: tuple[float, float] = (0.0, 0.0)  # (price_usd, cached_at_timestamp)
@@ -77,7 +79,13 @@ class ChainClient:
             data = resp.json()
             if "error" in data:
                 err = data["error"]
-                msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
+                if isinstance(err, dict):
+                    msg = err.get("message", str(err))
+                    err_data = err.get("data")
+                    if err_data:
+                        msg = f"{msg} (data: {err_data})"
+                else:
+                    msg = str(err)
                 raise RuntimeError(f"RPC Error [{method}]: {msg}")
             return data.get("result")
         except Exception as e:
@@ -277,11 +285,9 @@ class ChainClient:
     async def broadcast_raw_transaction(self, raw_tx: bytes) -> str:
         hex_data = f"0x{raw_tx.hex()}"
 
-        # Race ONLY primary RPC and fallback RPC in parallel (Hedged Dual-RPC Broadcast).
-        # Avoid direct sequencer URL so RPC nodes handle pre-execution ordering cleanly and
-        # return confirmed receipts on Poll #1 without HTTP/2 contention!
+        # Race primary RPC, fallback RPC, and any configured extra RPCs in parallel (Multi-RPC Shotgun Broadcast).
         endpoints = []
-        for u in [self.rpc_url, self.fallback_rpc_url]:
+        for u in [self.rpc_url, self.fallback_rpc_url] + self.extra_rpcs:
             if u and u not in endpoints:
                 endpoints.append(u)
 
@@ -301,7 +307,11 @@ class ChainClient:
                     err = data["error"]
                     msg = err.get("message", str(err)) if isinstance(err, dict) else str(err)
                     err_str = msg.lower()
-                    if "already known" in err_str or "nonce too low" in err_str:
+                    if any(k in err_str for k in (
+                        "already known", "known transaction", "nonce too low",
+                        "transaction already imported", "tx already in pool",
+                        "already imported", "replacement transaction underpriced",
+                    )):
                         return f"broadcasted ({msg})"
                     raise RuntimeError(f"RPC Error [{endpoint_url}]: {msg}")
                 res = data.get("result")
@@ -329,7 +339,11 @@ class ChainClient:
             # Check if any response was benign (already in mempool)
             for err in errors:
                 err_str = str(err).lower()
-                if "already known" in err_str or "nonce too low" in err_str:
+                if any(k in err_str for k in (
+                    "already known", "known transaction", "nonce too low",
+                    "transaction already imported", "tx already in pool",
+                    "already imported", "replacement transaction underpriced",
+                )):
                     return f"broadcasted ({err})"
 
             if errors:

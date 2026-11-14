@@ -838,9 +838,12 @@ class OpenSeaClient:
                     if is_not_started:
                         now_ts = time.time()
                         if stage.start_timestamp > 0 and now_ts < (stage.start_timestamp + 8.0):
-                            # Tight 10ms poll right around T-0, 25ms otherwise inside activation window
-                            tight_t0 = abs(now_ts - stage.start_timestamp) <= 2.5
-                            return ("retry", RuntimeError("Waiting for OpenSea stage activation..."), 0.010 if tight_t0 else 0.025)
+                            # Instant retry if clock has reached start_timestamp, minimal sleep otherwise
+                            if now_ts >= stage.start_timestamp:
+                                poll_delay = 0.001
+                            else:
+                                poll_delay = min(0.010, max(0.001, stage.start_timestamp - now_ts))
+                            return ("retry", RuntimeError("Waiting for OpenSea stage activation..."), poll_delay)
                         return ("fatal", RuntimeError("Wallet is not on the Allowlist for this stage"), 0.0)
 
                     if "InsufficientMintsRemainingError" in err_names or "MintQuantityMoreThanAllocatedForMinterError" in err_names:
@@ -899,16 +902,17 @@ class OpenSeaClient:
 
         last_err: Exception | None = None
         attempts = 1 if single_attempt else max_attempts
-        for attempt in range(1, attempts + 1):
-            current_q = int(variables["toAssets"][0]["quantity"])
+
+        async def _query_once(att: int) -> tuple[str, Any, float]:
+            cur_q = int(variables["toAssets"][0]["quantity"])
             use_rest = bool(self.api_key) and time.time() >= self._rest_rate_limited_until
 
             if use_rest:
                 gql_task = asyncio.create_task(
-                    self._query_gql_mint_action_once(client, stage, variables, headers, attempt)
+                    self._query_gql_mint_action_once(client, stage, variables, headers, att)
                 )
                 rest_task = asyncio.create_task(
-                    self._query_rest_mint_action_once(collection, wallet, stage, current_q, attempt)
+                    self._query_rest_mint_action_once(collection, wallet, stage, cur_q, att)
                 )
                 done, pending = await asyncio.wait({gql_task, rest_task}, return_when=asyncio.FIRST_COMPLETED)
 
@@ -922,7 +926,7 @@ class OpenSeaClient:
                             pt.cancel()
                         if pending:
                             await asyncio.gather(*pending, return_exceptions=True)
-                        return res[1]
+                        return res
                     if t is gql_task:
                         gql_res = res
                     else:
@@ -932,19 +936,66 @@ class OpenSeaClient:
                     rem_results = await asyncio.gather(*pending, return_exceptions=True)
                     for pt, res in zip(pending, rem_results):
                         if isinstance(res, tuple) and res[0] == "ok":
-                            return res[1]
+                            return res
                         if pt is gql_task and isinstance(res, tuple):
                             gql_res = res
                         elif pt is rest_task and isinstance(res, tuple):
                             rest_res = res
 
                 status, payload, delay = gql_res or ("fallback_retry", RuntimeError("OpenSea unavailable"), 0.0)
-                if status != "decrement" and rest_res and rest_res[0] == "decrement" and current_q > 1:
+                if status != "decrement" and rest_res and rest_res[0] == "decrement" and cur_q > 1:
                     status = "decrement"
+                return (status, payload, delay)
             else:
-                status, payload, delay = await self._query_gql_mint_action_once(
-                    client, stage, variables, headers, attempt
+                return await self._query_gql_mint_action_once(
+                    client, stage, variables, headers, att
                 )
+
+        attempt = 1
+        while attempt <= attempts:
+            current_q = int(variables["toAssets"][0]["quantity"])
+            now_ts = time.time()
+            # Speculative Staggered Hedging at T-0:
+            # If attempt 1 right around drop activation takes >55ms, launch attempt 2 concurrently!
+            is_at_t0_window = (
+                not single_attempt
+                and attempt == 1
+                and attempts >= 2
+                and stage.start_timestamp > 0
+                and now_ts < (stage.start_timestamp + 1.5)
+            )
+
+            if is_at_t0_window:
+                task1 = asyncio.create_task(_query_once(1))
+                done, _ = await asyncio.wait({task1}, timeout=0.055)
+                if task1 in done:
+                    status, payload, delay = task1.result()
+                else:
+                    # Task1 still in-flight after 55ms -> fire concurrent hedged probe Task2!
+                    task2 = asyncio.create_task(_query_once(2))
+                    d2, p2 = await asyncio.wait({task1, task2}, return_when=asyncio.FIRST_COMPLETED)
+                    first_res = None
+                    for t in d2:
+                        res = t.result()
+                        if res[0] == "ok":
+                            for pt in p2:
+                                pt.cancel()
+                            if p2:
+                                await asyncio.gather(*p2, return_exceptions=True)
+                            return res[1]
+                        first_res = res
+                    # If neither was "ok", wait remaining
+                    if p2:
+                        rem_res = await asyncio.gather(*p2, return_exceptions=True)
+                        for r_item in rem_res:
+                            if isinstance(r_item, tuple) and r_item[0] == "ok":
+                                return r_item[1]
+                            if isinstance(r_item, tuple):
+                                first_res = r_item
+                    status, payload, delay = first_res or ("fallback_retry", RuntimeError("OpenSea unavailable"), 0.0)
+                    attempt = 2  # accounted for both tasks
+            else:
+                status, payload, delay = await _query_once(attempt)
 
             if status == "ok":
                 return payload
@@ -956,6 +1007,7 @@ class OpenSeaClient:
             if status == "decrement":
                 if current_q > 1:
                     variables["toAssets"][0]["quantity"] = str(current_q - 1)
+                    attempt += 1
                     continue
                 raise last_err
 
@@ -981,10 +1033,12 @@ class OpenSeaClient:
 
             if status == "retry" and delay > 0:
                 await asyncio.sleep(delay)
+                attempt += 1
                 continue
 
             if attempt < attempts:
                 await asyncio.sleep(retry_interval_ms / 1000.0)
+            attempt += 1
 
         raise RuntimeError(f"OpenSea mint calldata unavailable: {last_err}")
 

@@ -2046,7 +2046,76 @@ def test_custom_gas_war_mode():
     asyncio.run(run_test())
 
 
+def test_shotgun_multi_rpc_and_revert_decode():
+    """Verify Multi-RPC Shotgun Broadcast races all extra endpoints, handles pool error messages, and preserves revert data."""
+    import asyncio
+    from unittest.mock import AsyncMock
+    from minter.chain import ChainClient
+    from minter.constants import decode_seadrop_error
+
+    async def run_test():
+        # 1. Test Multi-RPC Shotgun Racing
+        cl = ChainClient(
+            "https://rpc1.com",
+            fallback_rpc_url="https://rpc2.com",
+            extra_rpcs=["https://extra-rpc-1.com"],
+        )
+        called = []
+        mock_http = AsyncMock()
+
+        async def mock_post(url, json=None, headers=None):
+            called.append(url)
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            if url == "https://rpc1.com":
+                # Slow endpoint (1 sec lag)
+                await asyncio.sleep(0.5)
+                resp.json = lambda: {"result": "0xrpc1"}
+            elif url == "https://rpc2.com":
+                # Fails with 429
+                raise RuntimeError("429 Too Many Requests")
+            else:
+                # Extra fast RPC succeeds in 5ms with already known
+                await asyncio.sleep(0.005)
+                resp.json = lambda: {"error": {"code": -32000, "message": "tx already in pool"}}
+            return resp
+
+        mock_http.post = mock_post
+        cl.get_client = AsyncMock(return_value=mock_http)
+
+        tx_res = await cl.broadcast_raw_transaction(b"\x02\x01\x02")
+        assert "broadcasted" in tx_res
+        assert "https://extra-rpc-1.com" in called
+
+        # 2. Test revert data extraction
+        mock_err_http = AsyncMock()
+        mock_err_resp = AsyncMock()
+        mock_err_resp.raise_for_status = lambda: None
+        mock_err_resp.json = lambda: {
+            "error": {
+                "code": 3,
+                "message": "execution reverted",
+                "data": "0x3a8241510000000000000000000000000000000000000000000000000000000000000000"
+            }
+        }
+        mock_err_http.post = AsyncMock(return_value=mock_err_resp)
+        cl.get_client = AsyncMock(return_value=mock_err_http)
+
+        caught_err = ""
+        try:
+            await cl.rpc_request("eth_call", [{}])
+        except RuntimeError as ex:
+            caught_err = str(ex)
+
+        assert "0x3a824151" in caught_err
+        decoded = decode_seadrop_error(caught_err)
+        assert "Drop sold out" in decoded
+
+    asyncio.run(run_test())
+
+
 if __name__ == "__main__":
+    test_shotgun_multi_rpc_and_revert_decode()
     test_custom_gas_war_mode()
     test_hybrid_rest_and_gql_mint_race()
     test_revert_diagnosis_and_t0_timing()

@@ -22,7 +22,12 @@ class TelegramBot:
     def __init__(self, config: AppConfig, wallet_mgr: WalletManager) -> None:
         self.config = config
         self.wallets = wallet_mgr
-        self.chain = ChainClient(config.rpc_url, config.fallback_rpc_url)
+        self.chain = ChainClient(
+            config.rpc_url,
+            config.fallback_rpc_url,
+            sequencer_url=config.robinhood_sequencer_url,
+            extra_rpcs=config.extra_broadcast_rpcs,
+        )
         self.opensea = OpenSeaClient(
             timeout_seconds=config.opensea_timeout_ms / 1000.0,
             api_key=getattr(config, "opensea_api_key", ""),
